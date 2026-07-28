@@ -1923,7 +1923,11 @@ static const char *EULA_TXT =
 "# Das muss bewusst von dir gesetzt werden - der Server startet sonst nicht.\n"
 "eula=false\n";
 
-/* -- Server-Pack in den Zielordner erzeugen (silent=1: ohne Dialoge) -- */
+/* -- Server-Pack in den Zielordner erzeugen.
+ * silent = 0: Rueckfrage vor dem Bauen, Fehler und Ergebnis als Dialog
+ *         = 1: gar keine Dialoge (Batch-Modus ueber die Kommandozeile)
+ *         = 2: keine Rueckfrage, aber Fehler und Ergebnis werden gezeigt
+ *              (Online-Ablauf - dort wurde die Absicht schon zweimal geklickt) */
 static void build_server_pack(HWND hwnd, const char *out, int silent)
 {
     if (gFolder[0] == 0)
@@ -1934,7 +1938,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
     if ((int)SendMessageA(gListS, LB_GETCOUNT, 0, 0) +
         (int)SendMessageA(gListB, LB_GETCOUNT, 0, 0) +
         (int)SendMessageA(gListU, LB_GETCOUNT, 0, 0) == 0) {
-        if (!silent)
+        if (silent != 1)
             MessageBoxA(hwnd, "Keine Mods gescannt. Bitte zuerst einen Mods-Ordner scannen.",
                         "ModSorter", MB_OK | MB_ICONWARNING);
         return;
@@ -1949,7 +1953,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
         *sl = 0;
 
     if (_stricmp(out, gFolder) == 0 || _stricmp(out, root) == 0) {
-        if (!silent)
+        if (silent != 1)
             MessageBoxA(hwnd,
                         "Bitte einen anderen Zielordner waehlen - nicht den Mods-\n"
                         "oder Profilordner selbst.", "ModSorter", MB_OK | MB_ICONWARNING);
@@ -1968,7 +1972,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
     if (!mi || mc[0] == 0) {
         SetCursor(LoadCursor(NULL, IDC_ARROW));
         if (mi) free(mi);
-        if (!silent)
+        if (silent != 1)
             MessageBoxA(hwnd, "Minecraft-Version konnte nicht aus den Mods ermittelt werden.",
                         "ModSorter", MB_OK | MB_ICONERROR);
         else
@@ -2018,7 +2022,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
                  "%s-Versionen fuer Minecraft %s konnten nicht abgerufen werden.\n"
                  "Pruefe die Internetverbindung und versuche es erneut.",
                  loaderName, mc);
-        if (!silent)
+        if (silent != 1)
             MessageBoxA(hwnd, em, "ModSorter", MB_OK | MB_ICONERROR);
         else
             SetWindowTextA(gLblStatus, "FEHLER: Loader-Metadaten nicht erreichbar");
@@ -2287,7 +2291,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
                            "bitte Internetverbindung pruefen und erneut versuchen.");
     free(mi);
 
-    if (silent) {
+    if (silent == 1) {
         char st[220];
         snprintf(st, sizeof(st),
                  "Server-Pack fertig: %d Mods (+%d Deps), %d Configs, Java %d, Launcher %s",
@@ -3858,9 +3862,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 snprintf(gFolder, MAX_PATH, "%s\\mods", packDir);
                 SetWindowTextA(gEditPath, gFolder);
                 scan_folder(hwnd);
-                /* direkt bauen - kein zweiter Ordnerdialog */
+                /* direkt bauen - kein zweiter Ordnerdialog, keine Rueckfrage */
                 if (alsoServer)
-                    build_server_pack(hwnd, srvDir, 0);
+                    build_server_pack(hwnd, srvDir, 2);
                 return 0;
             }
 
