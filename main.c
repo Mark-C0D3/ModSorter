@@ -2805,7 +2805,8 @@ static void pick_finish(HWND hwnd, int server)
     if (sel < 0)
         return;
     int idx = (int)SendMessageA(gPickList, LB_GETITEMDATA, sel, 0);
-    gPickServer = server;
+    if (server >= 0)                      /* -1 = zuvor gewaehlte Absicht behalten */
+        gPickServer = server;
 
     if (gPickMode == 1) {                 /* Online-Treffer -> Versionen zeigen */
         if (idx < 0 || idx >= gInstN) return;
@@ -3121,7 +3122,7 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_COMMAND:
         if (HIWORD(wp) == LBN_DBLCLK && LOWORD(wp) == ID_PICK_LIST) {
-            pick_finish(hwnd, 0);
+            pick_finish(hwnd, -1);        /* Absicht des vorherigen Schritts behalten */
             return 0;
         }
         if (LOWORD(wp) == ID_PICK_SEARCH &&
@@ -3817,8 +3818,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             if (sel == -2) {                 /* Online-Pack: erst herunterladen */
                 char dest[MAX_PATH];
-                if (!pick_folder(hwnd,
-                        "Ordner waehlen, in den das Modpack geladen wird",
+                if (!pick_folder(hwnd, alsoServer
+                        ? "Ordner waehlen - darin entstehen 'modpack' und 'server'"
+                        : "Ordner waehlen, in den das Modpack geladen wird",
                         NULL, dest, sizeof(dest)))
                     return 0;
                 /* NUR den Pack-Namen bereinigen - nicht den ganzen Pfad,
@@ -3836,12 +3838,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (!safe[0])
                     strcpy(safe, "Modpack");
 
-                char sub[MAX_PATH];
-                snprintf(sub, sizeof(sub), "%s\\%s", dest, safe);
-                CreateDirectoryA(sub, NULL);
+                /* <ziel>\<Pack>\modpack  und  <ziel>\<Pack>\server */
+                char base[MAX_PATH], packDir[MAX_PATH], srvDir[MAX_PATH];
+                snprintf(base, sizeof(base), "%s\\%s", dest, safe);
+                CreateDirectoryA(base, NULL);
+                snprintf(packDir, sizeof(packDir), "%s\\modpack", base);
+                snprintf(srvDir, sizeof(srvDir), "%s\\server", base);
 
                 SetCursor(LoadCursor(NULL, IDC_WAIT));
-                int ok = download_mrpack(hwnd, gPickUrl, sub);
+                int ok = download_mrpack(hwnd, gPickUrl, packDir);
                 SetCursor(LoadCursor(NULL, IDC_ARROW));
                 if (!ok) {
                     MessageBoxA(hwnd,
@@ -3850,11 +3855,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 "ModSorter", MB_OK | MB_ICONERROR);
                     return 0;
                 }
-                snprintf(gFolder, MAX_PATH, "%s\\mods", sub);
+                snprintf(gFolder, MAX_PATH, "%s\\mods", packDir);
                 SetWindowTextA(gEditPath, gFolder);
                 scan_folder(hwnd);
+                /* direkt bauen - kein zweiter Ordnerdialog */
                 if (alsoServer)
-                    create_server_pack(hwnd);
+                    build_server_pack(hwnd, srvDir, 0);
                 return 0;
             }
 
