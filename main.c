@@ -132,6 +132,90 @@ static char *read_mod_meta(const char *folder, const char *file,
 
 static void scan_folder(HWND hwnd);   /* fwd */
 
+/* ================== Fortschrittsanzeige ==================
+ * Downloads laufen im UI-Thread. Damit das Fenster waehrend eines grossen
+ * Downloads nicht einfriert, pumpt die Leseschleife die Nachrichten mit und
+ * zeichnet einen Balken. gCancel bricht sauber ab, wenn das Fenster
+ * geschlossen wird. */
+static HWND   gMainWnd   = NULL;
+static int    gBusy      = 0;
+static int    gCancel    = 0;
+static double gProgFrac  = -1.0;      /* -1 = unbestimmt, kein Balken */
+static DWORD  gProgStart = 0;
+static DWORD  gProgLastPaint = 0;
+static char   gLabel[160] = "";       /* was gerade geladen wird */
+
+static void pump(void)
+{
+    MSG m;
+    while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
+        if (m.message == WM_QUIT) {
+            PostQuitMessage((int)m.wParam);
+            gCancel = 1;
+            return;
+        }
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+}
+
+/* Dauer als m:ss */
+static void fmt_time(double sec, char *out, int outsz)
+{
+    if (sec < 0 || sec > 359999) { snprintf(out, outsz, "--:--"); return; }
+    int s = (int)(sec + 0.5);
+    snprintf(out, outsz, "%d:%02d", s / 60, s % 60);
+}
+
+/* Byte-Zahl lesbar machen */
+static void fmt_size(double b, char *out, int outsz)
+{
+    if (b >= 1024.0 * 1024.0 * 1024.0) snprintf(out, outsz, "%.1f GB", b / (1024.0*1024.0*1024.0));
+    else if (b >= 1024.0 * 1024.0)     snprintf(out, outsz, "%.1f MB", b / (1024.0*1024.0));
+    else if (b >= 1024.0)              snprintf(out, outsz, "%.0f KB", b / 1024.0);
+    else                               snprintf(out, outsz, "%.0f B", b);
+}
+
+static void prog_begin(const char *text)
+{
+    gBusy = 1;
+    gCancel = 0;
+    gProgFrac = -1.0;
+    gProgStart = GetTickCount();
+    gProgLastPaint = 0;
+    if (gLblStatus && text)
+        SetWindowTextA(gLblStatus, text);
+    if (gMainWnd)
+        InvalidateRect(gMainWnd, NULL, FALSE);
+    pump();
+}
+
+/* frac < 0 -> nur Text, kein Balken. force=1 umgeht die Zeitdrossel. */
+static void prog_set(const char *text, double frac, int force)
+{
+    DWORD now = GetTickCount();
+    if (!force && now - gProgLastPaint < 100)
+        return;                       /* hoechstens 10x pro Sekunde neu zeichnen */
+    gProgLastPaint = now;
+    gProgFrac = frac;
+    if (gLblStatus && text)
+        SetWindowTextA(gLblStatus, text);
+    if (gMainWnd)
+        InvalidateRect(gMainWnd, NULL, FALSE);
+    pump();
+}
+
+static void prog_end(const char *text)
+{
+    gBusy = 0;
+    gProgFrac = -1.0;
+    if (gLblStatus && text)
+        SetWindowTextA(gLblStatus, text);
+    if (gMainWnd)
+        InvalidateRect(gMainWnd, NULL, FALSE);
+    pump();
+}
+
 /* ---- GDI+ nur fuer das Laden der Pack-Icons.
  * Die offiziellen Header sind C++-only, daher die flache API selbst deklariert. */
 typedef struct GpImage GpImage;
@@ -248,11 +332,12 @@ static LRESULT CALLBACK ListProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HDC dc = GetDC(h);
         RECT rc;
         GetClientRect(h, &rc);
+        FillRect(dc, &rc, gbrCard);      /* sonst bleibt alter Text stehen */
         rc.top += S(16);
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, gFont);
         SetTextColor(dc, RGB(98, 98, 108));
-        DrawTextA(dc, gScanned ? "keine" : "noch nicht gescannt", -1, &rc,
+        DrawTextA(dc, gScanned ? "none" : "not scanned yet", -1, &rc,
                   DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
         ReleaseDC(h, dc);
     }
@@ -1133,7 +1218,7 @@ static ModInfo *collect_mods(HWND hwnd, HWND lists[4], const int isServer[4],
 
             if ((idx % 10) == 0) {
                 char st[128];
-                snprintf(st, sizeof(st), "Lese Mod-Metadaten ... (%d/%d)", idx, total);
+                snprintf(st, sizeof(st), "Reading mod metadata ... (%d/%d)", idx, total);
                 SetWindowTextA(gLblStatus, st);
                 UpdateWindow(hwnd);
             }
@@ -1631,9 +1716,20 @@ static int download_file(const wchar_t *host, const wchar_t *path, const char *d
                                     WINHTTP_HEADER_NAME_BY_INDEX, &code, &cl,
                                     WINHTTP_NO_HEADER_INDEX);
                 if (code >= 200 && code < 300) {
+                    /* Groesse fuer den Fortschritt, falls der Server sie nennt */
+                    double expect = 0;
+                    wchar_t wlen[32];
+                    DWORD wl = sizeof(wlen);
+                    if (WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_LENGTH,
+                                            WINHTTP_HEADER_NAME_BY_INDEX, wlen,
+                                            &wl, WINHTTP_NO_HEADER_INDEX))
+                        expect = _wtof(wlen);
+
                     FILE *f = fopen(dest, "wb");
                     if (f) {
                         static char buf[65536];
+                        double done = 0;
+                        DWORD t0 = GetTickCount();
                         int failed = 0;
                         for (;;) {
                             DWORD got = 0;
@@ -1646,6 +1742,29 @@ static int download_file(const wchar_t *host, const wchar_t *path, const char *d
                             if (fwrite(buf, 1, got, f) != got) {
                                 failed = 1;
                                 break;
+                            }
+                            done += got;
+
+                            if (gBusy && gLabel[0]) {
+                                double el = (GetTickCount() - t0) / 1000.0;
+                                char s1[32], s2[32], eta[16], line[300];
+                                fmt_size(done, s1, sizeof(s1));
+                                if (expect > 0) {
+                                    fmt_size(expect, s2, sizeof(s2));
+                                    double rate = el > 0.3 ? done / el : 0;
+                                    fmt_time(rate > 0 ? (expect - done) / rate : -1,
+                                             eta, sizeof(eta));
+                                    snprintf(line, sizeof(line),
+                                             "%s  \x95  %s / %s  \x95  %.1f MB/s  \x95  %s left",
+                                             gLabel, s1, s2,
+                                             rate / (1024.0 * 1024.0), eta);
+                                    prog_set(line, done / expect, 0);
+                                } else {
+                                    snprintf(line, sizeof(line), "%s  \x95  %s",
+                                             gLabel, s1);
+                                    prog_set(line, -1.0, 0);
+                                }
+                                if (gCancel) { failed = 1; break; }
                             }
                         }
                         fclose(f);
@@ -1754,7 +1873,7 @@ static void scan_folder(HWND hwnd)
         return;
 
     SetCursor(LoadCursor(NULL, IDC_WAIT));
-    SetWindowTextA(gLblStatus, "Scanne Mods ...");
+    SetWindowTextA(gLblStatus, "Scanning mods ...");
     UpdateWindow(hwnd);
 
     /* --- 1. Alle .jar-Dateinamen einsammeln --- */
@@ -1789,7 +1908,7 @@ static void scan_folder(HWND hwnd)
         if (!sha1_file(full, hashes[i]))
             hashes[i][0] = 0;
     }
-    SetWindowTextA(gLblStatus, "Frage Modrinth ab ...");
+    SetWindowTextA(gLblStatus, "Querying Modrinth ...");
     UpdateWindow(hwnd);
     int resolved = modrinth_lookup(hashes, total, cat);
     int online = (resolved >= 0);
@@ -1835,11 +1954,11 @@ static void scan_folder(HWND hwnd)
     }
     if (online)
         snprintf(t, sizeof(t),
-                 "%d Mods erkannt  \x95  %d ueber Modrinth, %d lokal aus fabric.mod.json",
+                 "%d mods detected  \x95  %d via Modrinth, %d from local metadata",
                  total, fromModrinth, fromLocal);
     else
         snprintf(t, sizeof(t),
-                 "%d Mods erkannt  \x95  Modrinth nicht erreichbar, lokale Erkennung genutzt",
+                 "%d mods detected  \x95  Modrinth unreachable, used local metadata",
                  total);
     SetWindowTextA(gLblStatus, t);
 
@@ -1890,11 +2009,10 @@ static void copy_sorted(HWND hwnd)
 
     char t[256];
     snprintf(t, sizeof(t),
-             "Fertig: %d Datei(en) kopiert nach client\\ und server\\%s",
+             "Done: %d file(s) copied to client\\ and server\\%s",
              copied,
-             failed ? " (einige fehlgeschlagen)" : ".");
+             failed ? " (some failed)" : ".");
     SetWindowTextA(gLblStatus, t);
-    MessageBoxA(hwnd, t, "ModSorter", MB_OK | MB_ICONINFORMATION);
 }
 
 static const char *SCRIPT_BAT_HEAD =
@@ -1902,18 +2020,18 @@ static const char *SCRIPT_BAT_HEAD =
 "title Minecraft Server\n"
 "cd /d \"%~dp0\"\n"
 "\n"
-"REM ===== Arbeitsspeicher hier anpassen =====\n"
+"REM ===== Adjust memory here =====\n"
 "set MIN_RAM=2G\n"
 "set MAX_RAM=6G\n"
-"REM Andere Java-Version? Einfach den Pfad unten aendern.\n";
+"REM Different Java version? Just change the path below.\n";
 
 static const char *SCRIPT_BAT_TAIL =
-"REM =========================================\n"
+"REM ==============================\n"
 "\n"
 "\"%JAVA_CMD%\" -version >nul 2>&1\n"
 "if errorlevel 1 (\n"
-"    echo Java wurde nicht gefunden ^(JAVA_CMD=%JAVA_CMD%^).\n"
-"    echo Bitte Java installieren oder JAVA_CMD oben anpassen.\n"
+"    echo Java was not found ^(JAVA_CMD=%JAVA_CMD%^).\n"
+"    echo Please install Java or adjust JAVA_CMD above.\n"
 "    pause\n"
 "    exit /b 1\n"
 ")\n"
@@ -1921,9 +2039,9 @@ static const char *SCRIPT_BAT_TAIL =
 "findstr /i /c:\"eula=true\" eula.txt >nul 2>&1\n"
 "if errorlevel 1 (\n"
 "    echo.\n"
-"    echo Bitte zuerst die Minecraft-EULA akzeptieren:\n"
-"    echo   1. eula.txt oeffnen\n"
-"    echo   2. eula=false aendern zu eula=true\n"
+"    echo You must accept the Minecraft EULA first:\n"
+"    echo   1. Open eula.txt\n"
+"    echo   2. Change eula=false to eula=true\n"
 "    echo   EULA: https://aka.ms/MinecraftEULA\n"
 "    echo.\n"
 "    pause\n"
@@ -1934,32 +2052,32 @@ static const char *SCRIPT_BAT_TAIL =
 /* nach der Startzeile */
 static const char *SCRIPT_BAT_END =
 "echo.\n"
-"echo Server beendet.\n"
+"echo Server stopped.\n"
 "pause\n";
 
 static const char *SCRIPT_SH =
 "#!/usr/bin/env bash\n"
 "cd \"$(dirname \"$0\")\" || exit 1\n"
 "\n"
-"# ===== Arbeitsspeicher hier anpassen =====\n"
+"# ===== Adjust memory here =====\n"
 "MIN_RAM=2G\n"
 "MAX_RAM=6G\n"
-"# Andere Java-Version? Vollen Pfad eintragen, z.B.:\n"
+"# Different Java version? Enter the full path, e.g.:\n"
 "# JAVA_CMD=/usr/lib/jvm/java-25-openjdk/bin/java\n"
 "JAVA_CMD=java\n"
-"# =========================================\n"
+"# ==============================\n"
 "\n"
 "if ! \"$JAVA_CMD\" -version >/dev/null 2>&1; then\n"
-"    echo \"Java wurde nicht gefunden (JAVA_CMD=$JAVA_CMD).\"\n"
-"    echo \"Bitte Java installieren oder JAVA_CMD oben anpassen.\"\n"
+"    echo \"Java was not found (JAVA_CMD=$JAVA_CMD).\"\n"
+"    echo \"Please install Java or adjust JAVA_CMD above.\"\n"
 "    exit 1\n"
 "fi\n"
 "\n"
 "if ! grep -qi '^eula=true' eula.txt 2>/dev/null; then\n"
 "    echo\n"
-"    echo \"Bitte zuerst die Minecraft-EULA akzeptieren:\"\n"
-"    echo \"  1. eula.txt oeffnen\"\n"
-"    echo \"  2. eula=false aendern zu eula=true\"\n"
+"    echo \"You must accept the Minecraft EULA first:\"\n"
+"    echo \"  1. Open eula.txt\"\n"
+"    echo \"  2. Change eula=false to eula=true\"\n"
 "    echo \"  EULA: https://aka.ms/MinecraftEULA\"\n"
 "    echo\n"
 "    exit 1\n"
@@ -1968,9 +2086,9 @@ static const char *SCRIPT_SH =
 
 static const char *EULA_TXT =
 "# Minecraft EULA\n"
-"# Mit dem Aendern auf eula=true bestaetigst du, dass du die Minecraft-EULA\n"
-"# akzeptierst: https://aka.ms/MinecraftEULA\n"
-"# Das muss bewusst von dir gesetzt werden - der Server startet sonst nicht.\n"
+"# By changing this to eula=true you agree to the Minecraft EULA:\n"
+"# https://aka.ms/MinecraftEULA\n"
+"# This has to be set deliberately - the server will not start otherwise.\n"
 "eula=false\n";
 
 /* -- Server-Pack in den Zielordner erzeugen.
@@ -1989,7 +2107,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
         (int)SendMessageA(gListB, LB_GETCOUNT, 0, 0) +
         (int)SendMessageA(gListU, LB_GETCOUNT, 0, 0) == 0) {
         if (silent != 1)
-            MessageBoxA(hwnd, "Keine Mods gescannt. Bitte zuerst einen Mods-Ordner scannen.",
+            MessageBoxA(hwnd, "No mods scanned. Please scan a mods folder first.",
                         "ModSorter", MB_OK | MB_ICONWARNING);
         return;
     }
@@ -2005,15 +2123,15 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
     if (_stricmp(out, gFolder) == 0 || _stricmp(out, root) == 0) {
         if (silent != 1)
             MessageBoxA(hwnd,
-                        "Bitte einen anderen Zielordner waehlen - nicht den Mods-\n"
-                        "oder Profilordner selbst.", "ModSorter", MB_OK | MB_ICONWARNING);
+                        "Please choose a different target folder - not the mods\n"
+                        "or profile folder itself.", "ModSorter", MB_OK | MB_ICONWARNING);
         return;
     }
     CreateDirectoryA(out, NULL);
 
     /* Versionen ermitteln */
     SetCursor(LoadCursor(NULL, IDC_WAIT));
-    SetWindowTextA(gLblStatus, "Ermittle Minecraft-Version aus den Mods ...");
+    SetWindowTextA(gLblStatus, "Detecting Minecraft version ...");
     UpdateWindow(hwnd);
 
     char mc[24] = "";
@@ -2023,10 +2141,10 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
         SetCursor(LoadCursor(NULL, IDC_ARROW));
         if (mi) free(mi);
         if (silent != 1)
-            MessageBoxA(hwnd, "Minecraft-Version konnte nicht aus den Mods ermittelt werden.",
+            MessageBoxA(hwnd, "Could not detect the Minecraft version from the mods.",
                         "ModSorter", MB_OK | MB_ICONERROR);
         else
-            SetWindowTextA(gLblStatus, "FEHLER: MC-Version nicht erkannt");
+            SetWindowTextA(gLblStatus, "Error: could not detect the Minecraft version");
         return;
     }
 
@@ -2039,7 +2157,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
         reqJava = java_for_mc(mc);
 
     /* Passendes Java suchen (die von den Mods geforderte Version) */
-    SetWindowTextA(gLblStatus, "Suche passende Java-Version ...");
+    SetWindowTextA(gLblStatus, "Looking for a matching Java version ...");
     UpdateWindow(hwnd);
     char javaExe[MAX_PATH] = "";
     int javaVer = find_best_java(reqJava, javaExe, sizeof(javaExe));
@@ -2047,7 +2165,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
     const char *loaderName = (gLoader == LOADER_NEOFORGE) ? "NeoForge"
                            : (gLoader == LOADER_FORGE)    ? "Forge"
                                                           : "Fabric";
-    SetWindowTextA(gLblStatus, "Frage Loader-Versionen ab ...");
+    SetWindowTextA(gLblStatus, "Querying loader versions ...");
     UpdateWindow(hwnd);
     char loader[48] = "", installer[32] = "";
     int haveLoader;
@@ -2069,51 +2187,28 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
         free(mi);
         char em[240];
         snprintf(em, sizeof(em),
-                 "%s-Versionen fuer Minecraft %s konnten nicht abgerufen werden.\n"
-                 "Pruefe die Internetverbindung und versuche es erneut.",
+                 "Could not fetch %s versions for Minecraft %s.\n"
+                 "Please check your internet connection and try again.",
                  loaderName, mc);
         if (silent != 1)
             MessageBoxA(hwnd, em, "ModSorter", MB_OK | MB_ICONERROR);
         else
-            SetWindowTextA(gLblStatus, "FEHLER: Loader-Metadaten nicht erreichbar");
+            SetWindowTextA(gLblStatus, "Error: loader metadata unreachable");
         return;
     }
 
     char javaInfo[MAX_PATH + 96];
     if (javaVer == reqJava)
         snprintf(javaInfo, sizeof(javaInfo),
-                 "Java %d gefunden (von den Mods gefordert)", javaVer);
+                 "Java %d found (required by the mods)", javaVer);
     else if (javaVer)
         snprintf(javaInfo, sizeof(javaInfo),
-                 "Java %d eingetragen - Mods fordern %d!", javaVer, reqJava);
+                 "Java %d used - mods require %d!", javaVer, reqJava);
     else
         snprintf(javaInfo, sizeof(javaInfo),
-                 "kein Java gefunden - bitte Java %d installieren", reqJava);
+                 "no Java found - please install Java %d", reqJava);
 
-    char msg[1400];
-    snprintf(msg, sizeof(msg),
-             "Server-Pack jetzt erstellen?\n\n"
-             "Ziel:            %s\n"
-             "Minecraft:       %s\n"
-             "Loader:          %s %s\n"
-             "Mods:            %d  (davon %d als Abhaengigkeit ergaenzt)\n"
-             "Java:            %s\n\n"
-             "Es werden angelegt: mods\\, config\\ (kopiert),\n"
-             "%s\n"
-             "start.bat, start.sh, server.properties, eula.txt, LIESMICH.txt\n\n"
-             "Hinweis: eula.txt wird mit eula=false erstellt - die Minecraft-EULA\n"
-             "musst du selbst akzeptieren, bevor der Server startet.",
-             out, mc, loaderName, loader, modCount, promoted, javaInfo,
-             (gLoader == LOADER_NEOFORGE)
-                 ? "NeoForge-Server (Installer von maven.neoforged.net),"
-             : (gLoader == LOADER_FORGE)
-                 ? "Forge-Server (Installer von maven.minecraftforge.net),"
-                 : "fabric-server-launch.jar (Download von fabricmc.net),");
-    if (!silent && MessageBoxA(hwnd, msg, "Server-Pack erstellen",
-                               MB_OKCANCEL | MB_ICONQUESTION) != IDOK) {
-        free(mi);
-        return;
-    }
+    (void)javaInfo;
 
     SetCursor(LoadCursor(NULL, IDC_WAIT));
 
@@ -2130,7 +2225,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
         if (CopyFileA(s, d, FALSE))
             copiedMods++;
     }
-    SetWindowTextA(gLblStatus, "Kopiere Konfiguration ...");
+    SetWindowTextA(gLblStatus, "Copying configuration ...");
     UpdateWindow(hwnd);
 
     /* 2. serverrelevante Ordner kopieren */
@@ -2172,7 +2267,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
                      "libraries/net/minecraftforge/forge/%s", loader);
         }
 
-        snprintf(st, sizeof(st), "Lade %s-Installer ...", loaderName);
+        snprintf(st, sizeof(st), "Downloading %s installer ...", loaderName);
         SetWindowTextA(gLblStatus, st);
         UpdateWindow(hwnd);
 
@@ -2187,7 +2282,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
 
         if (got) {
             snprintf(st, sizeof(st),
-                     "Installiere %s-Server (kann 1-2 Minuten dauern) ...", loaderName);
+                     "Installing %s server (may take 1-2 minutes) ...", loaderName);
             SetWindowTextA(gLblStatus, st);
             UpdateWindow(hwnd);
             char cmd[1200];
@@ -2216,7 +2311,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
                  "@%s/unix_args.txt nogui\n", argdir);
     } else {
         /* Fabric: Server-Launcher-Jar laden */
-        SetWindowTextA(gLblStatus, "Lade Fabric-Server-Launcher ...");
+        SetWindowTextA(gLblStatus, "Downloading Fabric server launcher ...");
         UpdateWindow(hwnd);
         char apath[256];
         snprintf(apath, sizeof(apath), "/v2/versions/loader/%s/%s/%s/server/jar",
@@ -2266,7 +2361,7 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
     write_text(p, EULA_TXT, 1);
 
     snprintf(buf, sizeof(buf),
-             "#Minecraft server properties (von ModSorter erzeugt)\n"
+             "#Minecraft server properties (generated by ModSorter)\n"
              "motd=%s\n"
              "server-port=25565\n"
              "online-mode=true\n"
@@ -2284,74 +2379,83 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
     write_text(p, buf, 1);
 
     snprintf(buf, sizeof(buf),
-             "Server-Pack fuer: %s\n"
-             "Erzeugt mit ModSorter\n"
+             "Server pack for: %s\n"
+             "Generated by ModSorter\n"
              "\n"
              "Minecraft %s  /  %s %s\n"
-             "Enthaltene Mods: %d (Client-only-Mods wurden weggelassen,\n"
-             "%d Bibliotheken wurden als Abhaengigkeit ergaenzt)\n"
+             "Mods included: %d (client-only mods were left out,\n"
+             "%d libraries were added as dependencies)\n"
              "\n"
-             "SO STARTEST DU:\n"
-             "  1. eula.txt oeffnen und eula=false auf eula=true setzen\n"
-             "     (damit akzeptierst du https://aka.ms/MinecraftEULA)\n"
-             "  2. Windows: start.bat doppelklicken\n"
+             "HOW TO START:\n"
+             "  1. Open eula.txt and change eula=false to eula=true\n"
+             "     (this accepts https://aka.ms/MinecraftEULA)\n"
+             "  2. Windows: double-click start.bat\n"
              "     Linux:   chmod +x start.sh  &&  ./start.sh\n"
              "\n"
-             "JAVA: Version %d\n"
-             "  Die Mods dieses Packs fordern Java %d. In start.bat ist bereits\n"
-             "  der passende Pfad eingetragen:\n"
+             "JAVA: version %d\n"
+             "  The mods in this pack require Java %d. start.bat already points\n"
+             "  at a matching installation:\n"
              "  %s\n"
-             "  ACHTUNG: Eine NEUERE Java-Version funktioniert nicht unbedingt -\n"
-             "  manche Mods (z.B. Cobblemon) verlangen exakt diese Version.\n"
-             "  Unter Linux in start.sh JAVA_CMD auf ein Java %d setzen.\n"
+             "  NOTE: a NEWER Java version does not necessarily work - some mods\n"
+             "  (e.g. Cobblemon) require exactly this version.\n"
+             "  On Linux, set JAVA_CMD in start.sh to a Java %d.\n"
              "\n"
-             "Arbeitsspeicher: oben in start.bat / start.sh anpassbar (MAX_RAM).\n"
-             "Der erste Start laedt den Minecraft-Server nach und dauert laenger.\n"
+             "Memory: adjust MAX_RAM at the top of start.bat / start.sh.\n"
+             "The first start downloads the Minecraft server and takes longer.\n"
              "%s"
              "\n"
-             "Wichtig: Spieler brauchen zum Verbinden dasselbe Modpack\n"
-             "mit den Client-Mods.\n",
+             "Note: players need the same modpack with the client mods\n"
+             "in order to connect.\n",
              packName, mc, loaderName, loader, copiedMods, promoted, reqJava, reqJava,
-             javaVer ? javaExe : "(keins gefunden - bitte installieren)", reqJava,
+             javaVer ? javaExe : "(none found - please install one)", reqJava,
              gotDatapacks
-                 ? "\nHinweis: datapacks\\ wurde mitkopiert - Datapacks gehoeren\n"
-                   "je nach Pack in world\\datapacks\\.\n"
+                 ? "\nNote: datapacks\\ was copied along - depending on the pack,\n"
+                   "datapacks belong in world\\datapacks\\.\n"
                  : "");
-    snprintf(p, sizeof(p), "%s\\LIESMICH.txt", out);
+    snprintf(p, sizeof(p), "%s\\README.txt", out);
     write_text(p, buf, 1);
 
     SetCursor(LoadCursor(NULL, IDC_ARROW));
 
     char done[900];
     snprintf(done, sizeof(done),
-             "Server-Pack erstellt.\n\n"
-             "Ordner:   %s\n"
-             "Mods:     %d  (%d als Abhaengigkeit ergaenzt)\n"
-             "Configs:  %d Dateien\n"
-             "Java:     %s\n"
-             "Launcher: %s\n"
-             "Skripte:  start.bat (Windows), start.sh (Linux)\n\n"
-             "Naechster Schritt: eula.txt oeffnen und eula=true setzen,\n"
-             "dann start.bat bzw. start.sh ausfuehren.%s",
+             "Server pack created.\n\n"
+             "Folder:  %s\n"
+             "Mods:    %d  (%d added as dependencies)\n"
+             "Configs: %d files\n"
+             "Java:    %s\n"
+             "Server:  %s\n"
+             "Scripts: start.bat (Windows), start.sh (Linux)\n\n"
+             "Next step: open eula.txt, set eula=true,\n"
+             "then run start.bat or start.sh.%s",
              out, copiedMods, promoted, copiedCfg, javaInfo,
              gotJar ? ((gLoader == LOADER_FABRIC) ? "fabric-server-launch.jar"
-                                                  : "Serverkern installiert")
-                    : "FEHLGESCHLAGEN",
-             gotJar ? "" : "\n\nDer Serverkern konnte nicht eingerichtet werden -\n"
-                           "bitte Internetverbindung pruefen und erneut versuchen.");
+                                                  : "loader installed")
+                    : "FAILED",
+             gotJar ? "" : "\n\nThe server could not be set up -\n"
+                           "please check your internet connection and try again.");
     free(mi);
 
-    if (silent == 1) {
-        char st[220];
+    (void)done;
+
+    /* Kein Erfolgsdialog - das Ergebnis steht in der Statuszeile.
+     * Fehler werden weiterhin als Meldung gezeigt. */
+    char st[300];
+    if (gotJar)
         snprintf(st, sizeof(st),
-                 "Server-Pack fertig: %d Mods (+%d Deps), %d Configs, Java %d, Launcher %s",
-                 copiedMods, promoted, copiedCfg, reqJava, gotJar ? "OK" : "FEHLER");
-        SetWindowTextA(gLblStatus, st);
-    } else {
-        SetWindowTextA(gLblStatus, "Server-Pack fertig.");
-        MessageBoxA(hwnd, done, "ModSorter",
-                    MB_OK | (gotJar ? MB_ICONINFORMATION : MB_ICONWARNING));
-    }
+                 "Server pack ready  \x95  %d mods (+%d deps), %d configs, "
+                 "Java %d  \x95  %s",
+                 copiedMods, promoted, copiedCfg, reqJava, out);
+    else
+        snprintf(st, sizeof(st),
+                 "Server pack incomplete - the loader could not be installed");
+    prog_end(st);
+
+    if (!gotJar && silent != 1)
+        MessageBoxA(hwnd,
+                    "The server could not be set up completely.\n"
+                    "Please check your internet connection and try again.",
+                    "ModSorter", MB_OK | MB_ICONWARNING);
 }
 
 /* -- Zielordner waehlen und Server-Pack erstellen -- */
@@ -2361,7 +2465,7 @@ static void create_server_pack(HWND hwnd)
         return;
     char out[MAX_PATH];
     if (pick_folder(hwnd,
-                    "Zielordner fuer das Server-Pack waehlen (leerer Ordner empfohlen)",
+                    "Choose a target folder for the server pack (an empty folder is recommended)",
                     NULL, out, sizeof(out)))
         build_server_pack(hwnd, out, 0);
 }
@@ -2870,7 +2974,7 @@ static void pick_finish(HWND hwnd, int server)
         int n = modrinth_versions(gPickSlug);
         SetCursor(LoadCursor(NULL, IDC_ARROW));
         if (n <= 0) {
-            MessageBoxA(hwnd, "Keine Versionen gefunden.", "ModSorter",
+            MessageBoxA(hwnd, "No versions found.", "ModSorter",
                         MB_OK | MB_ICONWARNING);
             return;
         }
@@ -2907,13 +3011,13 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetBkMode(dc, TRANSPARENT);
         char head[200];
         if (gPickMode == 2)
-            snprintf(head, sizeof(head), "Version waehlen  \x95  %s", gPickName);
+            snprintf(head, sizeof(head), "Choose version  \x95  %s", gPickName);
         else if (gPickMode == 1)
-            snprintf(head, sizeof(head), "%d Treffer bei Modrinth", gInstN);
+            snprintf(head, sizeof(head), "%d results on Modrinth", gInstN);
         else
             snprintf(head, sizeof(head),
-                     gInstN ? "%d installierte Modpacks  \x95  oben suchen fuer weitere"
-                            : "Keine installierten Modpacks  \x95  oben nach Namen suchen",
+                     gInstN ? "%d installed modpacks  \x95  search above for more"
+                            : "No installed modpacks  \x95  search by name above",
                      gInstN);
         RECT t = { S(16), S(14), rc.right - S(16), S(40) };
         SelectObject(dc, gFontB);
@@ -3028,7 +3132,7 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                           DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
                 if (it->author[0] && tx + ts.cx + S(8) < card.right - S(160)) {
                     char by[96];
-                    snprintf(by, sizeof(by), "von %s", it->author);
+                    snprintf(by, sizeof(by), "by %s", it->author);
                     SelectObject(d->hDC, gFontSm);
                     RECT ar = { tx + ts.cx + S(8), ty + S(2),
                                 card.right - S(150), ty + S(20) };
@@ -3079,7 +3183,7 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                           DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
                 char fav[48];
-                snprintf(fav, sizeof(fav), "%d Favoriten", it->follows);
+                snprintf(fav, sizeof(fav), "%d followers", it->follows);
                 RECT fr = { card.right - S(146), card.top + S(32),
                             card.right - S(12), card.top + S(50) };
                 SelectObject(d->hDC, gFontSm);
@@ -3260,7 +3364,7 @@ static int pick_modpack(HWND owner, int *alsoServer)
     int y = orc.top + ((orc.bottom - orc.top) - H) / 2;
 
     gPickWnd = CreateWindowExA(WS_EX_DLGMODALFRAME, "ModSorterPick",
-                               "Modpack waehlen",
+                               "Choose modpack",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
                                x, y, W, H, owner, NULL,
                                (HINSTANCE)GetWindowLongPtrA(owner, GWLP_HINSTANCE),
@@ -3292,11 +3396,11 @@ static int pick_modpack(HWND owner, int *alsoServer)
                                              (LONG_PTR)SearchProc);
 
     struct { int id; const char *t; } btns[5] = {
-        { ID_PICK_CANCEL, "Abbrechen" },
-        { ID_PICK_BACK,   "Zurueck" },
-        { ID_PICK_LOAD,   "Laden" },
-        { ID_PICK_SERVER, "Server-Pack erstellen ..." },
-        { ID_PICK_GO,     "Suchen" },
+        { ID_PICK_CANCEL, "Cancel" },
+        { ID_PICK_BACK,   "Back" },
+        { ID_PICK_LOAD,   "Load" },
+        { ID_PICK_SERVER, "Create server pack ..." },
+        { ID_PICK_GO,     "Search" },
     };
     for (int i = 0; i < 5; i++) {
         HWND b = CreateWindowA("BUTTON", btns[i].t,
@@ -3358,16 +3462,17 @@ static int download_mrpack(HWND hwnd, const char *url, const char *dest)
     char pack[MAX_PATH];
     snprintf(pack, sizeof(pack), "%s\\pack.mrpack", dest);
 
-    SetWindowTextA(gLblStatus, "Lade Modpack-Datei ...");
-    UpdateWindow(hwnd);
+    prog_begin("Downloading modpack ...");
+    snprintf(gLabel, sizeof(gLabel), "Modpack archive");
     if (!download_url(url, pack)) {
-        SetWindowTextA(gLblStatus, "FEHLER: Modpack konnte nicht geladen werden");
+        gLabel[0] = 0;
+        prog_end(gCancel ? "Cancelled." : "Error: could not download the modpack");
         return 0;
     }
+    gLabel[0] = 0;
 
     /* overrides/ enthaelt Konfiguration und mitgelieferte Dateien */
-    SetWindowTextA(gLblStatus, "Entpacke Modpack ...");
-    UpdateWindow(hwnd);
+    prog_set("Extracting modpack ...", -1.0, 1);
     char cmd[1400];
     snprintf(cmd, sizeof(cmd),
              "tar.exe -xf \"%s\" -C \"%s\" overrides server-overrides", pack, dest);
@@ -3390,10 +3495,15 @@ static int download_mrpack(HWND hwnd, const char *url, const char *dest)
     snprintf(cmd, sizeof(cmd), "tar.exe -xOf \"%s\" modrinth.index.json", pack);
     char *idx = run_capture(cmd);
     if (!idx) {
-        SetWindowTextA(gLblStatus, "FEHLER: modrinth.index.json fehlt");
+        prog_end("Error: modrinth.index.json is missing from the pack");
         DeleteFileA(pack);
         return 0;
     }
+
+    /* Anzahl der Dateien vorab zaehlen, damit der Balken stimmt */
+    int fileCount = 0;
+    for (const char *cp = idx; (cp = strstr(cp, "\"downloads\"")) != NULL; cp += 11)
+        fileCount++;
 
     const char *e = idx + strlen(idx);
     const char *p = strstr(idx, "\"files\"");
@@ -3438,11 +3548,15 @@ static int download_mrpack(HWND hwnd, const char *url, const char *dest)
                 for (char *z = full; *z; z++)
                     if (*z == '/') *z = '\\';
                 ensure_dirs(full);
-                char st[200];
-                snprintf(st, sizeof(st), "Lade Mods ... (%d)", total);
-                SetWindowTextA(gLblStatus, st);
-                UpdateWindow(hwnd);
+
+                const char *base = strrchr(rel, '/');
+                base = base ? base + 1 : rel;
+                snprintf(gLabel, sizeof(gLabel), "[%d/%d] %s",
+                         total, fileCount ? fileCount : total, base);
+                prog_set(gLabel, fileCount ? (double)(total - 1) / fileCount : -1.0, 1);
+
                 if (download_url(durl, full)) done++; else failed++;
+                if (gCancel) break;
             }
             while (p < e && *p != ',' && *p != ']') p++;
             if (p < e && *p == ',') p++;
@@ -3450,12 +3564,16 @@ static int download_mrpack(HWND hwnd, const char *url, const char *dest)
     }
     free(idx);
     DeleteFileA(pack);
+    gLabel[0] = 0;
 
     char st[220];
-    snprintf(st, sizeof(st), "Modpack geladen: %d von %d Dateien%s",
-             done, total, failed ? " (einige fehlgeschlagen)" : "");
-    SetWindowTextA(gLblStatus, st);
-    return done > 0;
+    if (gCancel)
+        snprintf(st, sizeof(st), "Cancelled - %d of %d files downloaded", done, total);
+    else
+        snprintf(st, sizeof(st), "Modpack downloaded: %d of %d files%s",
+                 done, total, failed ? " (some failed)" : "");
+    prog_end(st);
+    return !gCancel && done > 0;
 }
 
 static void choose_folder(HWND hwnd)
@@ -3465,7 +3583,7 @@ static void choose_folder(HWND hwnd)
     GetWindowTextA(gEditPath, cur, sizeof(cur));
 
     char path[MAX_PATH];
-    if (pick_folder(hwnd, "Mods-Ordner waehlen", cur, path, sizeof(path))) {
+    if (pick_folder(hwnd, "Choose mods folder", cur, path, sizeof(path))) {
         strncpy(gFolder, path, MAX_PATH - 1);
         gFolder[MAX_PATH - 1] = 0;
         SetWindowTextA(gEditPath, gFolder);
@@ -3489,13 +3607,13 @@ static void scan_from_edit(HWND hwnd)
         s[--n] = 0;
 
     if (*s == 0) {
-        SetWindowTextA(gLblStatus, "Bitte einen Pfad eingeben oder waehlen.");
+        SetWindowTextA(gLblStatus, "Please enter or choose a path.");
         return;
     }
     DWORD attr = GetFileAttributesA(s);
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
         SetWindowTextA(gLblStatus,
-                       "Ordner nicht gefunden - bitte gueltigen Pfad angeben.");
+                       "Folder not found - please enter a valid path.");
         return;
     }
     strncpy(gFolder, s, MAX_PATH - 1);
@@ -3654,15 +3772,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         gFontSm = CreateFontA(fhs, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                               0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
 
+        gMainWnd = hwnd;
+
         BOOL dark = TRUE;
         DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                               &dark, sizeof(dark));
 
-        gBtnPick   = mk_button(hwnd, ID_BTN_PICK,   "Modpack waehlen ...");
-        gBtnChoose = mk_button(hwnd, ID_BTN_CHOOSE, "Durchsuchen ...");
-        gBtnScan   = mk_button(hwnd, ID_BTN_SCAN,   "Scannen");
-        gBtnCopy   = mk_button(hwnd, ID_BTN_COPY,   "In client\\ + server\\ kopieren");
-        gBtnServer = mk_button(hwnd, ID_BTN_SERVER, "Server-Pack erstellen ...");
+        gBtnPick   = mk_button(hwnd, ID_BTN_PICK,   "Choose modpack ...");
+        gBtnChoose = mk_button(hwnd, ID_BTN_CHOOSE, "Browse ...");
+        gBtnScan   = mk_button(hwnd, ID_BTN_SCAN,   "Scan");
+        gBtnCopy   = mk_button(hwnd, ID_BTN_COPY,   "Copy to client\\ + server\\");
+        gBtnServer = mk_button(hwnd, ID_BTN_SERVER, "Create server pack ...");
         EnableWindow(gBtnCopy, FALSE);
         EnableWindow(gBtnServer, FALSE);
 
@@ -3678,7 +3798,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                                    (LONG_PTR)EditProc);
 
         gLblStatus = mk_static(hwnd, ID_LBL_STATUS,
-                               "Mods-Ordner eingeben und Enter druecken \x95 oder Durchsuchen",
+                               "Enter a mods folder and press Enter \x95 or use Browse",
                                gFont);
 
         gListC = mk_list(hwnd, ID_LIST_CLIENT);
@@ -3740,11 +3860,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                   GetFocus() == gEditPath ? CACC : CBORDER);
 
         static const char *titles[4] = { "Client-only", "Server-only",
-                                         "Server / Client", "Unbekannt" };
+                                         "Server / Client", "Unknown" };
         for (int i = 0; i < 4; i++)
             draw_card(dc, i, titles[i]);
 
         hline(dc, S(16), rc.right - S(16), gBarY, CBORDER);
+
+        /* Fortschrittsbalken direkt ueber der unteren Leiste */
+        if (gBusy) {
+            RECT tr = { S(16), gBarY - S(9), rc.right - S(16), gBarY - S(3) };
+            round_box(dc, tr, S(3), mix(CBG, CTEXT, 8), mix(CBG, CTEXT, 12));
+            if (gProgFrac >= 0.0) {
+                double f = gProgFrac > 1.0 ? 1.0 : gProgFrac;
+                int w = (int)((tr.right - tr.left) * f);
+                if (w > S(4)) {
+                    RECT fr = { tr.left, tr.top, tr.left + w, tr.bottom };
+                    round_box(dc, fr, S(3), CACC, CACC);
+                }
+            } else {
+                /* unbestimmt: laufender Balken */
+                int span = tr.right - tr.left;
+                int w = span / 5;
+                int pos = (int)((GetTickCount() / 6) % (DWORD)(span + w)) - w;
+                int l = tr.left + (pos < 0 ? 0 : pos);
+                int r2 = tr.left + pos + w;
+                if (r2 > tr.right) r2 = tr.right;
+                if (r2 > l) {
+                    RECT fr = { l, tr.top, r2, tr.bottom };
+                    round_box(dc, fr, S(3), CACC, CACC);
+                }
+            }
+        }
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -3854,7 +4000,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
 
+    case WM_CLOSE:
+        if (gBusy) {                  /* laufenden Download sauber abbrechen */
+            gCancel = 1;
+            return 0;
+        }
+        break;
+
     case WM_COMMAND:
+        /* waehrend eines Downloads keine neuen Aktionen annehmen */
+        if (gBusy && HIWORD(wp) == BN_CLICKED)
+            return 0;
         /* Fokusrahmen ums Pfadfeld neu zeichnen */
         if (LOWORD(wp) == ID_EDIT_PATH &&
             (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)) {
@@ -3873,8 +4029,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (sel == -2) {                 /* Online-Pack: erst herunterladen */
                 char dest[MAX_PATH];
                 if (!pick_folder(hwnd, alsoServer
-                        ? "Ordner waehlen - darin entstehen 'modpack' und 'server'"
-                        : "Ordner waehlen, in den das Modpack geladen wird",
+                        ? "Choose a folder - 'modpack' and 'server' are created inside"
+                        : "Choose a folder to download the modpack into",
                         NULL, dest, sizeof(dest)))
                     return 0;
                 /* NUR den Pack-Namen bereinigen - nicht den ganzen Pfad,
@@ -3904,8 +4060,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SetCursor(LoadCursor(NULL, IDC_ARROW));
                 if (!ok) {
                     MessageBoxA(hwnd,
-                                "Das Modpack konnte nicht vollstaendig geladen werden.\n"
-                                "Bitte Internetverbindung pruefen.",
+                                "The modpack could not be downloaded completely.\n"
+                                "Please check your internet connection.",
                                 "ModSorter", MB_OK | MB_ICONERROR);
                     return 0;
                 }
@@ -4051,7 +4207,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
 
     HWND hwnd = CreateWindowExA(
         0, "ModSorterWin",
-        "ModSorter  -  Client/Server Mod-Sortierer (Fabric / NeoForge / Forge)",
+        "ModSorter  -  Client/Server Mod Sorter (Fabric / NeoForge / Forge)",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, S(1260), S(660),
         NULL, NULL, hInst, NULL);
