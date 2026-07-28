@@ -3821,11 +3821,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         "Ordner waehlen, in den das Modpack geladen wird",
                         NULL, dest, sizeof(dest)))
                     return 0;
+                /* NUR den Pack-Namen bereinigen - nicht den ganzen Pfad,
+                 * sonst wird der Doppelpunkt im Laufwerk zerstoert (C: -> C_) */
+                char safe[160];
+                strncpy(safe, gPickName, sizeof(safe) - 1);
+                safe[sizeof(safe) - 1] = 0;
+                for (char *z = safe; *z; z++)
+                    if (*z == ':' || *z == '*' || *z == '?' || *z == '\"' ||
+                        *z == '<' || *z == '>' || *z == '|' ||
+                        *z == '\\' || *z == '/') *z = '_';
+                size_t sl2 = strlen(safe);        /* Punkte am Ende sind unzulaessig */
+                while (sl2 > 0 && (safe[sl2 - 1] == '.' || safe[sl2 - 1] == ' '))
+                    safe[--sl2] = 0;
+                if (!safe[0])
+                    strcpy(safe, "Modpack");
+
                 char sub[MAX_PATH];
-                snprintf(sub, sizeof(sub), "%s\\%s", dest, gPickName);
-                for (char *z = sub; *z; z++)   /* Name als Ordner tauglich machen */
-                    if (*z == ':' || *z == '*' || *z == '?' || *z == '"' ||
-                        *z == '<' || *z == '>' || *z == '|') *z = '_';
+                snprintf(sub, sizeof(sub), "%s\\%s", dest, safe);
                 CreateDirectoryA(sub, NULL);
 
                 SetCursor(LoadCursor(NULL, IDC_WAIT));
