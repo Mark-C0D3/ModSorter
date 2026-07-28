@@ -1,0 +1,12 @@
+# Build-Ergebnisse
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.res
+*.manifest
+
+# Testausgaben
+/server/
+/client/
+/modpack/
