@@ -85,6 +85,9 @@ static int S(int v) { return MulDiv(v, gDpi, 96); }
 
 /* Kartengeometrie + Zaehler, gezeichnet in WM_PAINT */
 static RECT gCard[4];
+static RECT gEditBox;                  /* gezeichneter Rahmen um das Pfadfeld */
+static RECT gSearchBox;                /* dito im Auswahlfenster */
+static int  gTextH = 16;               /* Zeilenhoehe der Schrift */
 static int  gHdrH = 42;
 static int  gCnt[4] = { 0, 0, 0, 0 };
 static int  gBarY = 0;                 /* Oberkante der unteren Leiste */
@@ -2939,9 +2942,13 @@ static void pick_layout(HWND hwnd)
     GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom, m = S(16), btnH = S(36), gap = S(8);
 
-    /* Suchzeile */
+    /* Suchzeile - Feld mittig im gezeichneten Rahmen */
     int sy = S(44), bGo = S(104);
-    MoveWindow(gPickSearch, m, sy + S(1), W - 2 * m - gap - bGo, btnH - S(2), TRUE);
+    int sw = W - 2 * m - gap - bGo;
+    gSearchBox.left = m;  gSearchBox.top = sy;
+    gSearchBox.right = m + sw;  gSearchBox.bottom = sy + btnH;
+    int seh = gTextH + S(4);
+    MoveWindow(gPickSearch, m + S(2), sy + (btnH - seh) / 2, sw - S(4), seh, TRUE);
     MoveWindow(GetDlgItem(hwnd, ID_PICK_GO), W - m - bGo, sy, bGo, btnH, TRUE);
 
     int top = sy + btnH + S(14);
@@ -3026,11 +3033,7 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                   DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         /* Rahmen ums Suchfeld */
-        RECT er;
-        GetWindowRect(gPickSearch, &er);
-        MapWindowPoints(NULL, hwnd, (POINT *)&er, 2);
-        InflateRect(&er, S(1), S(1));
-        round_box(dc, er, S(8), CINPUT,
+        round_box(dc, gSearchBox, S(8), CINPUT,
                   GetFocus() == gPickSearch ? CACC : CBORDER);
         EndPaint(hwnd, &ps);
         return 0;
@@ -3638,7 +3641,15 @@ static void layout(HWND hwnd)
     if (ew < S(120)) ew = S(120);
     int x0 = m;
     MoveWindow(gBtnPick, x0, m, bPick, btnH, TRUE);        x0 += bPick + gap;
-    MoveWindow(gEditPath, x0, m + S(1), ew, btnH - S(2), TRUE); x0 += ew + gap;
+
+    /* Rahmen so hoch wie die Buttons, das Feld selbst nur so hoch wie der
+     * Text und darin mittig - ein einzeiliges EDIT setzt seinen Text sonst
+     * immer nach oben. */
+    gEditBox.left = x0;  gEditBox.top = m;
+    gEditBox.right = x0 + ew;  gEditBox.bottom = m + btnH;
+    int eh = gTextH + S(4);
+    MoveWindow(gEditPath, x0 + S(2), m + (btnH - eh) / 2, ew - S(4), eh, TRUE);
+    x0 += ew + gap;
     MoveWindow(gBtnChoose, x0, m, bBrowse, btnH, TRUE);    x0 += bBrowse + gap;
     MoveWindow(gBtnScan, x0, m, bScan, btnH, TRUE);
 
@@ -3774,6 +3785,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         gMainWnd = hwnd;
 
+        {   /* Zeilenhoehe der Schrift fuer die Feldhoehe */
+            HDC dc = GetDC(hwnd);
+            HGDIOBJ of = SelectObject(dc, gFont);
+            TEXTMETRICA tm;
+            GetTextMetricsA(dc, &tm);
+            gTextH = tm.tmHeight;
+            SelectObject(dc, of);
+            ReleaseDC(hwnd, dc);
+        }
+
         BOOL dark = TRUE;
         DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                               &dark, sizeof(dark));
@@ -3852,11 +3873,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetBkMode(dc, TRANSPARENT);
 
         /* Rahmen um das Eingabefeld (es hat selbst keinen mehr) */
-        RECT er;
-        GetWindowRect(gEditPath, &er);
-        MapWindowPoints(NULL, hwnd, (POINT *)&er, 2);
-        InflateRect(&er, S(1), S(1));
-        round_box(dc, er, S(8), CINPUT,
+        round_box(dc, gEditBox, S(8), CINPUT,
                   GetFocus() == gEditPath ? CACC : CBORDER);
 
         static const char *titles[4] = { "Client-only", "Server-only",
@@ -4014,9 +4031,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* Fokusrahmen ums Pfadfeld neu zeichnen */
         if (LOWORD(wp) == ID_EDIT_PATH &&
             (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)) {
-            RECT er;
-            GetWindowRect(gEditPath, &er);
-            MapWindowPoints(NULL, hwnd, (POINT *)&er, 2);
+            RECT er = gEditBox;
             InflateRect(&er, S(3), S(3));
             InvalidateRect(hwnd, &er, FALSE);
             return 0;
