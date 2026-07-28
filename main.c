@@ -1599,18 +1599,68 @@ static int url_split(const char *url, wchar_t *whost, int hn,
     return 1;
 }
 
-/* Datei per HTTPS herunterladen */
+/* Datei per HTTPS herunterladen - stueckweise direkt auf die Platte.
+ * NICHT ueber https_request: das puffert die ganze Datei im Speicher, was bei
+ * grossen Modpacks (COBBLEVERSE: 227 MB) in einem laenger laufenden Prozess
+ * an der Speicherfragmentierung scheitert und eine abgeschnittene Datei
+ * hinterlaesst. */
 static int download_file(const wchar_t *host, const wchar_t *path, const char *dest)
 {
-    DWORD len = 0;
-    char *data = https_request(host, L"GET", path, NULL, 0, &len);
-    if (!data || len == 0) { if (data) free(data); return 0; }
-    FILE *f = fopen(dest, "wb");
-    if (!f) { free(data); return 0; }
-    size_t w = fwrite(data, 1, len, f);
-    fclose(f);
-    free(data);
-    return w == len;
+    HINTERNET s = WinHttpOpen(L"ModSorter/1.0 (Fabric mod sorter)",
+                              WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s)
+        return 0;
+    WinHttpSetTimeouts(s, 10000, 10000, 30000, 60000);
+
+    int ok = 0;
+    HINTERNET c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (c) {
+        HINTERNET r = WinHttpOpenRequest(c, L"GET", path, NULL,
+                                         WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         WINHTTP_FLAG_SECURE);
+        if (r) {
+            if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(r, NULL)) {
+
+                DWORD code = 0, cl = sizeof(code);
+                WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE |
+                                       WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &code, &cl,
+                                    WINHTTP_NO_HEADER_INDEX);
+                if (code >= 200 && code < 300) {
+                    FILE *f = fopen(dest, "wb");
+                    if (f) {
+                        static char buf[65536];
+                        int failed = 0;
+                        for (;;) {
+                            DWORD got = 0;
+                            if (!WinHttpReadData(r, buf, sizeof(buf), &got)) {
+                                failed = 1;
+                                break;
+                            }
+                            if (got == 0)
+                                break;                 /* fertig */
+                            if (fwrite(buf, 1, got, f) != got) {
+                                failed = 1;
+                                break;
+                            }
+                        }
+                        fclose(f);
+                        ok = !failed;
+                        if (!ok)
+                            DeleteFileA(dest);         /* keine halben Dateien */
+                    }
+                }
+            }
+            WinHttpCloseHandle(r);
+        }
+        WinHttpCloseHandle(c);
+    }
+    WinHttpCloseHandle(s);
+    return ok;
 }
 
 /* Bild von einer URL laden und als HBITMAP zurueckgeben (NULL bei Fehler).
