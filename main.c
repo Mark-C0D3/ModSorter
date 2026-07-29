@@ -2768,17 +2768,19 @@ static void free_icons(void)
         }
 }
 
-static void search_modrinth(const char *query)
+/* sort: 0 = Relevanz, 1 = Downloads, 2 = zuletzt aktualisiert */
+static void search_modrinth(const char *query, int offset, int sort)
 {
-    free_icons();
-    gInstN = 0;
     char q[512];
     url_encode(query, q, sizeof(q));
+    const char *idx = (sort == 1) ? "downloads"
+                    : (sort == 2) ? "updated"
+                                  : "relevance";
 
     char path[900];
     snprintf(path, sizeof(path),
              "/v2/search?query=%s&facets=%%5B%%5B%%22project_type:modpack%%22%%5D%%5D"
-             "&limit=20&index=relevance", q);
+             "&limit=20&offset=%d&index=%s", q, offset, idx);
     wchar_t wp[900];
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 900);
 
@@ -2952,16 +2954,18 @@ static char *cf_request(const char *path, const char *body, DWORD *outLen)
 }
 
 /* Modpacks bei CurseForge suchen und an gInst anhaengen */
-static void search_curseforge(const char *query)
+static void search_curseforge(const char *query, int offset, int sort)
 {
     if (!gCfKey[0])
         return;
     char q[512];
     url_encode(query, q, sizeof(q));
+    /* CurseForge: 2 = Beliebtheit, 3 = zuletzt aktualisiert, 6 = Downloads */
+    int sf = (sort == 1) ? 6 : (sort == 2) ? 3 : 2;
     char path[800];
     snprintf(path, sizeof(path),
              "/v1/mods/search?gameId=432&classId=4471&searchFilter=%s"
-             "&pageSize=20&sortField=2&sortOrder=desc", q);
+             "&pageSize=20&index=%d&sortField=%d&sortOrder=desc", q, offset, sf);
 
     DWORD len = 0;
     char *r = cf_request(path, NULL, &len);
@@ -3019,10 +3023,20 @@ static void search_curseforge(const char *query)
         const char *ap = strstr(o, "\"authors\"");
         if (ap && ap < p)
             json_str(ap, p, "name", it->author, sizeof(it->author));
-        char dt[40];
-        if (json_str(o, p, "dateModified", dt, sizeof(dt))) {
-            strncpy(it->updated, dt, 10);
-            it->updated[10] = 0;
+        /* Das Modpack-Objekt enthaelt eingebettete Kategorien und Dateien, die
+         * ebenfalls ein dateModified tragen - das eigene steht ganz hinten,
+         * also den LETZTEN Treffer nehmen. */
+        {
+            const char *last = NULL, *sp2 = o;
+            while ((sp2 = strstr(sp2, "\"dateModified\"")) != NULL && sp2 < p) {
+                last = sp2;
+                sp2 += 14;
+            }
+            char dt[40];
+            if (last && json_str(last, p, "dateModified", dt, sizeof(dt))) {
+                strncpy(it->updated, dt, 10);
+                it->updated[10] = 0;
+            }
         }
         utf8_fix(it->name, sizeof(it->name));
         utf8_fix(it->author, sizeof(it->author));
@@ -3121,6 +3135,43 @@ static int curseforge_versions(int modId)
 #define ID_PICK_SEARCH 2005
 #define ID_PICK_GO     2006
 #define ID_PICK_BACK   2007
+#define ID_PICK_SRC    2008
+#define ID_PICK_SORT   2009
+#define ID_PICK_MORE   2010
+
+static int  gSrcFilter = 0;      /* 0 = beide, 1 = nur Modrinth, 2 = nur CurseForge */
+static int  gSortMode  = 0;      /* 0 = Relevanz, 1 = Downloads, 2 = aktualisiert */
+static int  gPage      = 0;
+static char gQuery[256] = "";
+
+static const char *src_label(void)
+{
+    return gSrcFilter == 1 ? "Source: Modrinth"
+         : gSrcFilter == 2 ? "Source: CurseForge"
+                           : "Source: All";
+}
+static const char *sort_label(void)
+{
+    return gSortMode == 1 ? "Sort: Downloads"
+         : gSortMode == 2 ? "Sort: Updated"
+                          : "Sort: Relevance";
+}
+
+/* Suche ausfuehren; append=1 haengt die naechste Seite an */
+static void do_search(HWND hwnd, int append)
+{
+    (void)hwnd;
+    if (!append) {
+        free_icons();
+        gInstN = 0;
+        gPage = 0;
+    } else {
+        gPage++;
+    }
+    int off = gPage * 20;
+    if (gSrcFilter != 2) search_modrinth(gQuery, off, gSortMode);
+    if (gSrcFilter != 1) search_curseforge(gQuery, off, gSortMode);
+}
 
 /* 0 = installierte Packs, 1 = Online-Treffer, 2 = Versionsliste */
 static int  gPickMode = 0;
@@ -3156,6 +3207,10 @@ static void pick_fill(HWND hwnd)
     EnableWindow(GetDlgItem(hwnd, ID_PICK_LOAD), n > 0 && gPickMode != 1);
     EnableWindow(GetDlgItem(hwnd, ID_PICK_SERVER), n > 0);
     EnableWindow(GetDlgItem(hwnd, ID_PICK_BACK), gPickMode != 0);
+    /* Nachladen und Sortierung nur in der Trefferliste sinnvoll */
+    EnableWindow(GetDlgItem(hwnd, ID_PICK_MORE), gPickMode == 1);
+    EnableWindow(GetDlgItem(hwnd, ID_PICK_SORT), gPickMode != 2);
+    EnableWindow(GetDlgItem(hwnd, ID_PICK_SRC),  gPickMode != 2);
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -3174,7 +3229,14 @@ static void pick_layout(HWND hwnd)
     MoveWindow(gPickSearch, m + S(2), sy + (btnH - seh) / 2, sw - S(4), seh, TRUE);
     MoveWindow(GetDlgItem(hwnd, ID_PICK_GO), W - m - bGo, sy, bGo, btnH, TRUE);
 
-    int top = sy + btnH + S(14);
+    /* Filterzeile: Quelle, Sortierung, rechts das Nachladen */
+    int fy = sy + btnH + S(8), fh = S(30);
+    int bSrc = S(158), bSort = S(150), bMore = S(128);
+    MoveWindow(GetDlgItem(hwnd, ID_PICK_SRC), m, fy, bSrc, fh, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_PICK_SORT), m + bSrc + gap, fy, bSort, fh, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_PICK_MORE), W - m - bMore, fy, bMore, fh, TRUE);
+
+    int top = fy + fh + S(12);
     int listH = H - top - m - btnH - S(12);
     if (listH < S(80)) listH = S(80);
     MoveWindow(gPickList, m, top, W - 2 * m, listH, TRUE);
@@ -3423,14 +3485,16 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DrawTextA(d->hDC, stats, -1, &sr,
                           DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
-                char fav[48];
-                snprintf(fav, sizeof(fav), "%d followers", it->follows);
-                RECT fr = { card.right - S(146), card.top + S(32),
-                            card.right - S(12), card.top + S(50) };
-                SelectObject(d->hDC, gFontSm);
-                SetTextColor(d->hDC, CMUTED);
-                DrawTextA(d->hDC, fav, -1, &fr,
-                          DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+                if (it->follows > 0) {      /* CurseForge liefert das nicht */
+                    char fav[48];
+                    snprintf(fav, sizeof(fav), "%d followers", it->follows);
+                    RECT fr = { card.right - S(146), card.top + S(32),
+                                card.right - S(12), card.top + S(50) };
+                    SelectObject(d->hDC, gFontSm);
+                    SetTextColor(d->hDC, CMUTED);
+                    DrawTextA(d->hDC, fav, -1, &fr,
+                              DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+                }
 
                 if (it->updated[0]) {
                     RECT ur = { card.right - S(146), card.bottom - S(26),
@@ -3535,19 +3599,42 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             GetWindowTextA(gPickSearch, q, sizeof(q));
             char *s = q;
             while (*s == ' ') s++;
-            if (!*s) {                       /* leer -> wieder installierte zeigen */
+            /* leeres Feld UND kein Quellenfilter -> installierte Packs zeigen.
+             * Mit gewaehlter Quelle wird auch ohne Begriff gestoebert. */
+            if (!*s && gSrcFilter == 0) {
                 gPickMode = 0;
                 enum_instances();
             } else {
+                strncpy(gQuery, s, sizeof(gQuery) - 1);
+                gQuery[sizeof(gQuery) - 1] = 0;
                 SetCursor(LoadCursor(NULL, IDC_WAIT));
-                search_modrinth(s);          /* setzt gInstN zurueck */
-                search_curseforge(s);        /* haengt an */
+                do_search(hwnd, 0);
                 SetCursor(LoadCursor(NULL, IDC_ARROW));
                 gPickMode = 1;
             }
             pick_fill(hwnd);
             return 0;
         }
+        case ID_PICK_MORE:
+            if (gPickMode == 1) {
+                SetCursor(LoadCursor(NULL, IDC_WAIT));
+                do_search(hwnd, 1);
+                SetCursor(LoadCursor(NULL, IDC_ARROW));
+                pick_fill(hwnd);
+            }
+            return 0;
+        case ID_PICK_SRC:
+            gSrcFilter = (gSrcFilter + 1) % 3;
+            SetWindowTextA(GetDlgItem(hwnd, ID_PICK_SRC), src_label());
+            if (gPickMode == 1 || gSrcFilter != 0)
+                SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_PICK_GO, 0), 0);
+            return 0;
+        case ID_PICK_SORT:
+            gSortMode = (gSortMode + 1) % 3;
+            SetWindowTextA(GetDlgItem(hwnd, ID_PICK_SORT), sort_label());
+            if (gPickMode == 1)
+                SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_PICK_GO, 0), 0);
+            return 0;
         case ID_PICK_BACK:
             if (gPickMode == 2) {            /* zurueck zur Trefferliste */
                 gPickMode = 1;
@@ -3637,14 +3724,17 @@ static int pick_modpack(HWND owner, int *alsoServer)
     gSearchOrig = (WNDPROC)SetWindowLongPtrA(gPickSearch, GWLP_WNDPROC,
                                              (LONG_PTR)SearchProc);
 
-    struct { int id; const char *t; } btns[5] = {
+    struct { int id; const char *t; } btns[8] = {
         { ID_PICK_CANCEL, "Cancel" },
         { ID_PICK_BACK,   "Back" },
         { ID_PICK_LOAD,   "Load" },
         { ID_PICK_SERVER, "Create server pack ..." },
         { ID_PICK_GO,     "Search" },
+        { ID_PICK_SRC,    src_label() },
+        { ID_PICK_SORT,   sort_label() },
+        { ID_PICK_MORE,   "More results" },
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 8; i++) {
         HWND b = CreateWindowA("BUTTON", btns[i].t,
                                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                0, 0, 10, 10, gPickWnd,
