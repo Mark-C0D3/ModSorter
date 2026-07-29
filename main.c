@@ -180,6 +180,19 @@ static void fmt_size(double b, char *out, int outsz)
     else                               snprintf(out, outsz, "%.0f B", b);
 }
 
+/* Nur den Streifen mit dem Fortschrittsbalken anfordern - nicht das ganze
+ * Fenster, sonst werden die vier Karten zehnmal pro Sekunde neu gemalt und
+ * flackern sichtbar. */
+static void prog_invalidate(void)
+{
+    if (!gMainWnd)
+        return;
+    RECT rc;
+    GetClientRect(gMainWnd, &rc);
+    RECT pr = { S(14), gBarY - S(12), rc.right - S(14), gBarY + S(2) };
+    InvalidateRect(gMainWnd, &pr, FALSE);
+}
+
 static void prog_begin(const char *text)
 {
     gBusy = 1;
@@ -189,8 +202,7 @@ static void prog_begin(const char *text)
     gProgLastPaint = 0;
     if (gLblStatus && text)
         SetWindowTextA(gLblStatus, text);
-    if (gMainWnd)
-        InvalidateRect(gMainWnd, NULL, FALSE);
+    prog_invalidate();
     pump();
 }
 
@@ -204,8 +216,7 @@ static void prog_set(const char *text, double frac, int force)
     gProgFrac = frac;
     if (gLblStatus && text)
         SetWindowTextA(gLblStatus, text);
-    if (gMainWnd)
-        InvalidateRect(gMainWnd, NULL, FALSE);
+    prog_invalidate();
     pump();
 }
 
@@ -215,8 +226,7 @@ static void prog_end(const char *text)
     gProgFrac = -1.0;
     if (gLblStatus && text)
         SetWindowTextA(gLblStatus, text);
-    if (gMainWnd)
-        InvalidateRect(gMainWnd, NULL, FALSE);
+    prog_invalidate();
     pump();
 }
 
@@ -4448,9 +4458,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
+        HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc;
         GetClientRect(hwnd, &rc);
+
+        /* Doppelpufferung: nur der angeforderte Ausschnitt, mit verschobenem
+         * Ursprung, damit unten weiter in Fensterkoordinaten gezeichnet wird */
+        int pw = ps.rcPaint.right - ps.rcPaint.left;
+        int ph = ps.rcPaint.bottom - ps.rcPaint.top;
+        if (pw <= 0 || ph <= 0) { EndPaint(hwnd, &ps); return 0; }
+        HDC dc = CreateCompatibleDC(hdc);
+        HBITMAP bb = CreateCompatibleBitmap(hdc, pw, ph);
+        HGDIOBJ oldbb = SelectObject(dc, bb);
+        SetWindowOrgEx(dc, ps.rcPaint.left, ps.rcPaint.top, NULL);
+
         FillRect(dc, &rc, gbrBg);
         SetBkMode(dc, TRANSPARENT);
 
@@ -4491,6 +4512,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
 
+        BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top, pw, ph,
+               dc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+        SelectObject(dc, oldbb);
+        DeleteObject(bb);
+        DeleteDC(dc);
         EndPaint(hwnd, &ps);
         return 0;
     }
