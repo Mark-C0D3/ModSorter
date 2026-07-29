@@ -887,6 +887,60 @@ static const char *json_skip_value(const char *p, const char *e)
     return p;
 }
 
+/* -- Wert eines Schluessels auf OBERSTER Ebene des Objekts finden.
+ * Noetig, weil einfaches Suchen nach "id" sonst in verschachtelten Objekten
+ * landet: CurseForge stellt z.B. "screenshots":[{"id":...}] voran. -- */
+static const char *json_find_top(const char *b, const char *e, const char *key)
+{
+    const char *p = b;
+    if (p >= e || *p != '{')
+        return NULL;
+    p++;
+    size_t kl = strlen(key);
+    while (p < e) {
+        while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' ||
+                         *p == '\n' || *p == ',')) p++;
+        if (p >= e || *p == '}' || *p != '\"')
+            return NULL;
+        p++;
+        const char *ks = p;
+        while (p < e && *p != '\"') { if (*p == '\\') p++; p++; }
+        size_t len = (size_t)(p - ks);
+        if (p < e) p++;
+        while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        if (p < e && *p == ':') p++;
+        while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        if (len == kl && strncmp(ks, key, kl) == 0)
+            return p;
+        p = json_skip_value(p, e);
+    }
+    return NULL;
+}
+
+/* Zahl bzw. Zeichenkette eines Schluessels auf oberster Ebene */
+static int json_int_top(const char *b, const char *e, const char *key)
+{
+    const char *v = json_find_top(b, e, key);
+    return v ? atoi(v) : 0;
+}
+
+static int json_str_top(const char *b, const char *e, const char *key,
+                        char *out, int outsz)
+{
+    const char *v = json_find_top(b, e, key);
+    out[0] = 0;
+    if (!v || v >= e || *v != '\"')
+        return 0;
+    v++;
+    int i = 0;
+    while (v < e && *v != '\"' && i < outsz - 1) {
+        if (*v == '\\' && v + 1 < e) v++;
+        out[i++] = *v++;
+    }
+    out[i] = 0;
+    return 1;
+}
+
 /* -- Schluessel eines Objekts sammeln (b zeigt auf '{') -- */
 static int json_keys(const char *b, const char *e, char (*out)[64], int max)
 {
@@ -2988,16 +3042,13 @@ static void search_curseforge(const char *query, int offset, int sort)
                    else if (ch == '}') { depth--; if (depth == 0) { p++; break; } } }
         }
 
+        /* Nur Schluessel der obersten Ebene lesen - das Objekt enthaelt
+         * screenshots, categories, authors und latestFiles mit gleichen
+         * Feldnamen. */
         char name[128];
-        if (!json_str(o, p, "name", name, sizeof(name)))
+        if (!json_str_top(o, p, "name", name, sizeof(name)))
             continue;
-        int id = 0;
-        const char *ip = strstr(o, "\"id\"");
-        if (ip && ip < p) {
-            const char *q2 = ip + 4;
-            while (q2 < p && (*q2 == ' ' || *q2 == ':')) q2++;
-            id = atoi(q2);
-        }
+        int id = json_int_top(o, p, "id");
         if (!id)
             continue;
 
@@ -3012,31 +3063,16 @@ static void search_curseforge(const char *query, int offset, int sort)
         snprintf(it->path, MAX_PATH, "%d", id);
         it->online = 2;
 
-        const char *dp = strstr(o, "\"downloadCount\"");
-        if (dp && dp < p) {
-            const char *q2 = dp + 15;
-            while (q2 < p && (*q2 == ' ' || *q2 == ':')) q2++;
-            it->mods = atoi(q2);
-        }
-        json_str(o, p, "summary", it->desc, sizeof(it->desc));
+        it->mods = json_int_top(o, p, "downloadCount");
+        json_str_top(o, p, "summary", it->desc, sizeof(it->desc));
         /* Autor: erster Eintrag in "authors" */
-        const char *ap = strstr(o, "\"authors\"");
-        if (ap && ap < p)
+        const char *ap = json_find_top(o, p, "authors");
+        if (ap)
             json_str(ap, p, "name", it->author, sizeof(it->author));
-        /* Das Modpack-Objekt enthaelt eingebettete Kategorien und Dateien, die
-         * ebenfalls ein dateModified tragen - das eigene steht ganz hinten,
-         * also den LETZTEN Treffer nehmen. */
-        {
-            const char *last = NULL, *sp2 = o;
-            while ((sp2 = strstr(sp2, "\"dateModified\"")) != NULL && sp2 < p) {
-                last = sp2;
-                sp2 += 14;
-            }
-            char dt[40];
-            if (last && json_str(last, p, "dateModified", dt, sizeof(dt))) {
-                strncpy(it->updated, dt, 10);
-                it->updated[10] = 0;
-            }
+        char dt[40];
+        if (json_str_top(o, p, "dateModified", dt, sizeof(dt))) {
+            strncpy(it->updated, dt, 10);
+            it->updated[10] = 0;
         }
         utf8_fix(it->name, sizeof(it->name));
         utf8_fix(it->author, sizeof(it->author));
@@ -3084,15 +3120,9 @@ static int curseforge_versions(int modId)
         }
 
         char disp[96];
-        if (!json_str(o, p, "displayName", disp, sizeof(disp)))
+        if (!json_str_top(o, p, "displayName", disp, sizeof(disp)))
             continue;
-        int fid = 0;
-        const char *ip = strstr(o, "\"id\"");
-        if (ip && ip < p) {
-            const char *q2 = ip + 4;
-            while (q2 < p && (*q2 == ' ' || *q2 == ':')) q2++;
-            fid = atoi(q2);
-        }
+        int fid = json_int_top(o, p, "id");
         if (!fid) continue;
 
         if (gVerN >= gVerCap) {
@@ -3105,8 +3135,8 @@ static int curseforge_versions(int modId)
         utf8_fix(v->name, sizeof(v->name));
         v->cfFileId = fid;
         v->cfModId = modId;
-        json_str(o, p, "fileName", v->filename, sizeof(v->filename));
-        json_str(o, p, "downloadUrl", v->url, sizeof(v->url));
+        json_str_top(o, p, "fileName", v->filename, sizeof(v->filename));
+        json_str_top(o, p, "downloadUrl", v->url, sizeof(v->url));
 
         /* gameVersions enthaelt MC-Version und Loader gemischt */
         char gv[12][64];
@@ -3268,8 +3298,16 @@ static void pick_finish(HWND hwnd, int server)
                                    : modrinth_versions(gPickSlug);
         SetCursor(LoadCursor(NULL, IDC_ARROW));
         if (n <= 0) {
-            MessageBoxA(hwnd, "No versions found.", "ModSorter",
-                        MB_OK | MB_ICONWARNING);
+            char em[400];
+            snprintf(em, sizeof(em),
+                     "No versions found for this modpack.\n\n"
+                     "Pack:   %s\n"
+                     "Source: %s\n"
+                     "Id:     %s",
+                     gPickName,
+                     gPickSource == 2 ? "CurseForge" : "Modrinth",
+                     gPickSlug);
+            MessageBoxA(hwnd, em, "ModSorter", MB_OK | MB_ICONWARNING);
             return;
         }
         gPickMode = 2;
