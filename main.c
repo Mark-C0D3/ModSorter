@@ -2648,7 +2648,8 @@ typedef struct {
     char tags[4][28];
     int  ntags;
     int  follows;
-    HBITMAP icon;
+    char iconUrl[400];
+    HBITMAP icon;                 /* wird im Hintergrund nachgeladen */
 } Instance;
 
 static Instance *gInst = NULL;
@@ -2913,11 +2914,8 @@ static void search_modrinth(const char *query, int offset, int sort)
                 for (int t = 0; t < it->ntags; t++)
                     utf8_fix(it->tags[t], sizeof(it->tags[t]));
 
-                /* WebP kann GDI+ nicht - dann bleibt icon NULL und es wird
-                 * eine Kachel mit den Anfangsbuchstaben gezeichnet. */
-                char iconUrl[500];
-                if (json_str(o, p, "icon_url", iconUrl, sizeof(iconUrl)) && iconUrl[0])
-                    it->icon = load_icon(iconUrl);
+                /* nur merken - geladen wird spaeter im Hintergrund */
+                json_str(o, p, "icon_url", it->iconUrl, sizeof(it->iconUrl));
             }
             while (p < e && *p != ',' && *p != ']') p++;
             if (p < e && *p == ',') p++;
@@ -3078,13 +3076,10 @@ static void search_curseforge(const char *query, int offset, int sort)
         utf8_fix(it->author, sizeof(it->author));
         utf8_fix(it->desc, sizeof(it->desc));
 
-        /* Logo */
-        const char *lp = strstr(o, "\"logo\"");
-        if (lp && lp < p) {
-            char iconUrl[500];
-            if (json_str(lp, p, "url", iconUrl, sizeof(iconUrl)) && iconUrl[0])
-                it->icon = load_icon(iconUrl);
-        }
+        /* Logo nur merken - geladen wird spaeter im Hintergrund */
+        const char *lp = json_find_top(o, p, "logo");
+        if (lp)
+            json_str(lp, p, "url", it->iconUrl, sizeof(it->iconUrl));
 
         while (p < e && *p != ',' && *p != ']') p++;
         if (p < e && *p == ',') p++;
@@ -3158,6 +3153,61 @@ static int curseforge_versions(int modId)
     return gVerN;
 }
 
+/* ---- Icons im Hintergrund nachladen ----
+ * Die Treffer erscheinen sofort; die Bilder trudeln nach und werden per
+ * Nachricht an das Fenster gemeldet. Nur der UI-Thread fasst gInst an. */
+#define WM_ICON_READY (WM_APP + 1)
+
+typedef struct { LONG gen; int idx; HBITMAP bmp; } IconMsg;
+typedef struct { LONG gen; int n; char (*urls)[400]; } IconTask;
+
+static volatile LONG gIconGen = 0;     /* zaehlt bei jeder neuen Trefferliste hoch */
+
+static DWORD WINAPI icon_worker(LPVOID param)
+{
+    IconTask *t = (IconTask *)param;
+    for (int i = 0; i < t->n; i++) {
+        if (gIconGen != t->gen)
+            break;                     /* Liste wurde inzwischen ersetzt */
+        if (!t->urls[i][0])
+            continue;
+        HBITMAP b = load_icon(t->urls[i]);
+        if (!b)
+            continue;
+        HWND w = gPickWnd;
+        if (gIconGen != t->gen || !w) { DeleteObject(b); break; }
+        IconMsg *m = (IconMsg *)malloc(sizeof(IconMsg));
+        m->gen = t->gen; m->idx = i; m->bmp = b;
+        if (!PostMessageA(w, WM_ICON_READY, 0, (LPARAM)m)) {
+            DeleteObject(b);
+            free(m);
+            break;
+        }
+    }
+    free(t->urls);
+    free(t);
+    return 0;
+}
+
+/* Ladeauftrag aus der aktuellen Trefferliste erzeugen */
+static void start_icon_loader(void)
+{
+    InterlockedIncrement(&gIconGen);
+    if (gInstN <= 0)
+        return;
+    IconTask *t = (IconTask *)malloc(sizeof(IconTask));
+    t->gen = gIconGen;
+    t->n = gInstN;
+    t->urls = (char (*)[400])malloc(sizeof(char[400]) * gInstN);
+    for (int i = 0; i < gInstN; i++) {
+        strncpy(t->urls[i], gInst[i].icon ? "" : gInst[i].iconUrl, 399);
+        t->urls[i][399] = 0;
+    }
+    HANDLE h = CreateThread(NULL, 0, icon_worker, t, 0, NULL);
+    if (h) CloseHandle(h);
+    else { free(t->urls); free(t); }
+}
+
 #define ID_PICK_LIST   2001
 #define ID_PICK_LOAD   2002
 #define ID_PICK_SERVER 2003
@@ -3201,6 +3251,7 @@ static void do_search(HWND hwnd, int append)
     int off = gPage * 20;
     if (gSrcFilter != 2) search_modrinth(gQuery, off, gSortMode);
     if (gSrcFilter != 1) search_curseforge(gQuery, off, gSortMode);
+    start_icon_loader();          /* Bilder kommen im Hintergrund nach */
 }
 
 /* 0 = installierte Packs, 1 = Online-Treffer, 2 = Versionsliste */
@@ -3391,6 +3442,25 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return (LRESULT)gbrCard;
     }
 
+    case WM_ICON_READY: {
+        IconMsg *m = (IconMsg *)lp;
+        if (m) {
+            if (m->gen == gIconGen && m->idx >= 0 && m->idx < gInstN &&
+                !gInst[m->idx].icon) {
+                gInst[m->idx].icon = m->bmp;
+                /* nur die betroffene Zeile neu zeichnen */
+                RECT ir;
+                if (SendMessageA(gPickList, LB_GETITEMRECT, m->idx,
+                                 (LPARAM)&ir) != LB_ERR)
+                    InvalidateRect(gPickList, &ir, FALSE);
+            } else {
+                DeleteObject(m->bmp);
+            }
+            free(m);
+        }
+        return 0;
+    }
+
     case WM_MEASUREITEM: {
         LPMEASUREITEMSTRUCT mi = (LPMEASUREITEMSTRUCT)lp;
         if (mi->CtlType == ODT_LISTBOX)
@@ -3409,6 +3479,19 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (idx < 0 || idx >= lim)
                 return TRUE;
             int sel = (d->itemState & ODS_SELECTED) != 0;
+
+            /* Doppelpufferung: erst abseits zeichnen, dann in einem Zug
+             * kopieren - sonst flackert die Liste beim Scrollen. */
+            HDC   realDC = d->hDC;
+            RECT  realR  = d->rcItem;
+            int   bw = realR.right - realR.left, bh = realR.bottom - realR.top;
+            HDC   mdc = CreateCompatibleDC(realDC);
+            HBITMAP mbm = CreateCompatibleBitmap(realDC, bw, bh);
+            HGDIOBJ oldBm = SelectObject(mdc, mbm);
+            d->hDC = mdc;
+            d->rcItem.left = 0; d->rcItem.top = 0;
+            d->rcItem.right = bw; d->rcItem.bottom = bh;
+
             RECT r = d->rcItem;
             SetBkMode(d->hDC, TRANSPARENT);
 
@@ -3541,7 +3624,7 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     DrawTextA(d->hDC, it->updated, -1, &ur,
                               DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
                 }
-                return TRUE;
+                goto lb_done;
             }
 
             /* ---- kompakte Zeile: installierte Packs und Versionen ---- */
@@ -3580,6 +3663,14 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DrawTextA(d->hDC, left, -1, &rl,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE |
                       DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        lb_done:
+            BitBlt(realDC, realR.left, realR.top, bw, bh, mdc, 0, 0, SRCCOPY);
+            SelectObject(mdc, oldBm);
+            DeleteObject(mbm);
+            DeleteDC(mdc);
+            d->hDC = realDC;
+            d->rcItem = realR;
             return TRUE;
         }
 
