@@ -3244,8 +3244,21 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         char head[200];
         if (gPickMode == 2)
             snprintf(head, sizeof(head), "Choose version  \x95  %s", gPickName);
-        else if (gPickMode == 1)
-            snprintf(head, sizeof(head), "%d results on Modrinth", gInstN);
+        else if (gPickMode == 1) {
+            int nMr = 0, nCf = 0;
+            for (int i = 0; i < gInstN; i++) {
+                if (gInst[i].online == 2) nCf++;
+                else                      nMr++;
+            }
+            if (nMr && nCf)
+                snprintf(head, sizeof(head),
+                         "%d results  \x95  %d Modrinth, %d CurseForge",
+                         gInstN, nMr, nCf);
+            else if (nCf)
+                snprintf(head, sizeof(head), "%d results on CurseForge", nCf);
+            else
+                snprintf(head, sizeof(head), "%d results on Modrinth", nMr);
+        }
         else
             snprintf(head, sizeof(head),
                      gInstN ? "%d installed modpacks  \x95  search above for more"
