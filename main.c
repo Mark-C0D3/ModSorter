@@ -26,6 +26,7 @@
 #include <uxtheme.h>
 #include <commctrl.h>
 #include <shlwapi.h>
+#include <richedit.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -88,6 +89,49 @@ static RECT gCard[4];
 static RECT gEditBox;                  /* gezeichneter Rahmen um das Pfadfeld */
 static RECT gSearchBox;                /* dito im Auswahlfenster */
 static int  gTextH = 16;               /* Zeilenhoehe der Schrift */
+
+/* Tabs links: 0 = Home, 1 = Browse, 2 = Servers */
+enum { TAB_HOME = 0, TAB_BROWSE = 1, TAB_SERVERS = 2 };
+static int   gTab = TAB_BROWSE;
+static RECT  gTabRect[3];
+static int   gSideW = 200;             /* Breite der Sidebar */
+static int   gContentLeft = 0;         /* linke Kante des rechten Bereichs */
+
+/* Feature-Karussell und -Liste im Home-Tab */
+typedef struct {
+    char  name[128], author[80], desc[300];
+    int   downloads;
+    char  slug[96];               /* Modrinth-slug oder CurseForge-Id als Text */
+    int   source;                 /* 1 = Modrinth, 2 = CurseForge */
+    char  iconUrl[400];
+    HBITMAP icon;
+} Feature;
+
+static Feature gHomeTop[5];       /* Karussell */
+static int  gHomeTopN = 0, gHomeIdx = 0;
+static Feature gHomeFeat[12];     /* darunter */
+static int  gHomeFeatN = 0;
+static int  gHomeLoaded = 0;
+static int  gHomeLoading = 0;
+
+/* Server-Verwaltung */
+typedef struct {
+    char name[128];
+    char path[MAX_PATH];          /* Server-Ordner */
+    char mc[24];
+    char loader[64];              /* z.B. "Fabric 0.19.3" */
+    int  mods;
+} ServerEntry;
+
+static ServerEntry *gServers = NULL;
+static int gServersN = 0, gServersCap = 0;
+static int gServerSel = -1;
+static HWND gServerList = NULL;
+static HWND gServerTerm = NULL;    /* Ausgabe (Rich Edit) */
+static HWND gServerInput = NULL;
+static HANDLE gServerProc = NULL;
+static HANDLE gServerStdIn = NULL;
+static HANDLE gServerReadThread = NULL;
 static int  gHdrH = 42;
 static int  gCnt[4] = { 0, 0, 0, 0 };
 static int  gBarY = 0;                 /* Oberkante der unteren Leiste */
@@ -246,6 +290,277 @@ int WINAPI GdipCreateHBITMAPFromBitmap(GpImage *bmp, HBITMAP *hbm, DWORD bkgnd);
 int WINAPI GdipDisposeImage(GpImage *img);
 
 static ULONG_PTR gGdiplusToken = 0;
+
+/* ================== Server-Verwaltung ================== */
+
+/* Pfad zur servers.json neben der exe */
+static void servers_path(char *out, int outsz)
+{
+    GetModuleFileNameA(NULL, out, outsz);
+    char *sl = strrchr(out, '\\');
+    if (sl) strcpy(sl + 1, "servers.json");
+}
+
+/* aus einer JSON-Datei eine ganz einfache Liste lesen:
+ * [{"name":"...","path":"...","mc":"...","loader":"...","mods":N}, ...] */
+static void servers_load(void)
+{
+    char p[MAX_PATH];
+    servers_path(p, sizeof(p));
+    FILE *f = fopen(p, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    if (n <= 0 || n > 1024*1024) { fclose(f); return; }
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(n + 1);
+    fread(buf, 1, n, f);
+    buf[n] = 0;
+    fclose(f);
+
+    gServersN = 0;
+    const char *e = buf + n;
+    const char *pp = strchr(buf, '[');
+    if (pp) pp++;
+    while (pp && pp < e) {
+        while (pp < e && *pp != '{' && *pp != ']') pp++;
+        if (pp >= e || *pp == ']') break;
+        const char *o = pp;
+        int depth = 0, instr = 0;
+        for (; pp < e; pp++) {
+            char ch = *pp;
+            if (instr) { if (ch == '\\') pp++; else if (ch == '\"') instr = 0; }
+            else { if (ch == '\"') instr = 1; else if (ch == '{') depth++;
+                   else if (ch == '}') { depth--; if (depth == 0) { pp++; break; } } }
+        }
+        if (gServersN >= gServersCap) {
+            gServersCap = gServersCap ? gServersCap * 2 : 16;
+            gServers = realloc(gServers, sizeof(ServerEntry) * gServersCap);
+        }
+        ServerEntry *s = &gServers[gServersN];
+        memset(s, 0, sizeof(*s));
+        json_str(o, pp, "name", s->name, sizeof(s->name));
+        json_str(o, pp, "path", s->path, sizeof(s->path));
+        json_str(o, pp, "mc",   s->mc,   sizeof(s->mc));
+        json_str(o, pp, "loader", s->loader, sizeof(s->loader));
+        s->mods = json_int_top(o, pp, "mods");
+        /* nur behalten, wenn der Ordner noch existiert */
+        DWORD a = GetFileAttributesA(s->path);
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
+            gServersN++;
+    }
+    free(buf);
+}
+
+static void json_write_str(FILE *f, const char *s)
+{
+    fputc('\"', f);
+    for (; *s; s++) {
+        if (*s == '\"' || *s == '\\') fputc('\\', f);
+        if (*s == '\n') { fputs("\\n", f); continue; }
+        if (*s == '\r') { fputs("\\r", f); continue; }
+        fputc(*s, f);
+    }
+    fputc('\"', f);
+}
+
+static void servers_save(void)
+{
+    char p[MAX_PATH];
+    servers_path(p, sizeof(p));
+    FILE *f = fopen(p, "wb");
+    if (!f) return;
+    fputs("[\n", f);
+    for (int i = 0; i < gServersN; i++) {
+        ServerEntry *s = &gServers[i];
+        fputs("  {", f);
+        fputs("\"name\":", f);   json_write_str(f, s->name);
+        fputs(",\"path\":", f);  json_write_str(f, s->path);
+        fputs(",\"mc\":", f);    json_write_str(f, s->mc);
+        fputs(",\"loader\":", f);json_write_str(f, s->loader);
+        fprintf(f, ",\"mods\":%d}", s->mods);
+        if (i < gServersN - 1) fputc(',', f);
+        fputc('\n', f);
+    }
+    fputs("]\n", f);
+    fclose(f);
+}
+
+/* Neuen Server merken (Duplikate am selben Pfad ersetzen) */
+static void servers_add(const char *name, const char *path, const char *mc,
+                        const char *loader, int mods)
+{
+    for (int i = 0; i < gServersN; i++)
+        if (_stricmp(gServers[i].path, path) == 0) {
+            ServerEntry *s = &gServers[i];
+            strncpy(s->name, name, 127);
+            strncpy(s->mc, mc, 23);
+            strncpy(s->loader, loader, 63);
+            s->mods = mods;
+            servers_save();
+            return;
+        }
+    if (gServersN >= gServersCap) {
+        gServersCap = gServersCap ? gServersCap * 2 : 16;
+        gServers = realloc(gServers, sizeof(ServerEntry) * gServersCap);
+    }
+    ServerEntry *s = &gServers[gServersN++];
+    memset(s, 0, sizeof(*s));
+    strncpy(s->name, name, 127);
+    strncpy(s->path, path, MAX_PATH - 1);
+    strncpy(s->mc, mc, 23);
+    strncpy(s->loader, loader, 63);
+    s->mods = mods;
+    servers_save();
+}
+
+/* ---- Server-Prozess mit umgeleiteten Pipes ---- */
+#define WM_TERM_APPEND (WM_APP + 5)
+#define WM_TERM_EXIT   (WM_APP + 6)
+
+typedef struct { HANDLE r; HWND wnd; } TermReader;
+
+static DWORD WINAPI term_reader(LPVOID p)
+{
+    TermReader *t = (TermReader *)p;
+    char buf[4096];
+    DWORD got;
+    while (ReadFile(t->r, buf, sizeof(buf) - 1, &got, NULL) && got > 0) {
+        char *s = malloc(got + 1);
+        memcpy(s, buf, got);
+        s[got] = 0;
+        if (!PostMessageA(t->wnd, WM_TERM_APPEND, 0, (LPARAM)s)) {
+            free(s);
+            break;
+        }
+    }
+    PostMessageA(t->wnd, WM_TERM_EXIT, 0, 0);
+    CloseHandle(t->r);
+    free(t);
+    return 0;
+}
+
+static int server_running(void)
+{
+    if (!gServerProc) return 0;
+    DWORD code = 0;
+    if (GetExitCodeProcess(gServerProc, &code) && code == STILL_ACTIVE)
+        return 1;
+    return 0;
+}
+
+static void server_stop(void)
+{
+    if (gServerStdIn) {
+        DWORD w;
+        WriteFile(gServerStdIn, "stop\r\n", 6, &w, NULL);
+    }
+}
+
+static void server_kill(void)
+{
+    if (gServerProc) {
+        TerminateProcess(gServerProc, 1);
+        CloseHandle(gServerProc);
+        gServerProc = NULL;
+    }
+    if (gServerStdIn) { CloseHandle(gServerStdIn); gServerStdIn = NULL; }
+}
+
+/* Starte den Server aus dem Ordner path. Ruft die start.bat auf, damit die
+ * Loader-Args korrekt sind. cmd.exe leitet auf die eigenen Pipes um. */
+static int server_start(const char *path, HWND wnd)
+{
+    if (server_running()) return 0;
+    server_kill();
+
+    SECURITY_ATTRIBUTES sa;
+    ZeroMemory(&sa, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL;
+    if (!CreatePipe(&inR, &inW, &sa, 0)) return 0;
+    if (!CreatePipe(&outR, &outW, &sa, 0)) {
+        CloseHandle(inR); CloseHandle(inW); return 0;
+    }
+    SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = inR;
+    si.hStdOutput = outW;
+    si.hStdError = outW;
+    ZeroMemory(&pi, sizeof(pi));
+
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd), "cmd.exe /c \"\"%s\\start.bat\"\"", path);
+
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, path, &si, &pi);
+    CloseHandle(inR);
+    CloseHandle(outW);
+    if (!ok) {
+        CloseHandle(inW); CloseHandle(outR);
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    gServerProc = pi.hProcess;
+    gServerStdIn = inW;
+
+    TermReader *t = malloc(sizeof(TermReader));
+    t->r = outR;
+    t->wnd = wnd;
+    gServerReadThread = CreateThread(NULL, 0, term_reader, t, 0, NULL);
+    return 1;
+}
+
+static void server_send(const char *line);   /* fwd */
+
+static void servers_fill_list(void)
+{
+    if (!gServerList) return;
+    SendMessageA(gServerList, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < gServersN; i++) {
+        int p = (int)SendMessageA(gServerList, LB_ADDSTRING, 0,
+                                  (LPARAM)gServers[i].name);
+        SendMessageA(gServerList, LB_SETITEMDATA, p, i);
+    }
+    if (gServersN > 0) {
+        gServerSel = 0;
+        SendMessageA(gServerList, LB_SETCURSEL, 0, 0);
+    } else {
+        gServerSel = -1;
+    }
+}
+
+/* Enter im Server-Terminal-Eingabefeld schickt die Zeile an den Prozess */
+static WNDPROC gServerInputOrig;
+static LRESULT CALLBACK ServerInputProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if ((m == WM_KEYDOWN || m == WM_CHAR) && w == VK_RETURN) {
+        if (m == WM_KEYDOWN) {
+            char line[512];
+            GetWindowTextA(h, line, sizeof(line));
+            SetWindowTextA(h, "");
+            if (line[0]) server_send(line);
+        }
+        return 0;
+    }
+    return CallWindowProcA(gServerInputOrig, h, m, w, l);
+}
+
+static void server_send(const char *line)
+{
+    if (!gServerStdIn) return;
+    DWORD w;
+    WriteFile(gServerStdIn, line, (DWORD)strlen(line), &w, NULL);
+    WriteFile(gServerStdIn, "\r\n", 2, &w, NULL);
+}
 
 /* ================== Zeichenhelfer ================== */
 
@@ -2551,12 +2866,17 @@ static void build_server_pack(HWND hwnd, const char *out, int silent)
     /* Kein Erfolgsdialog - das Ergebnis steht in der Statuszeile.
      * Fehler werden weiterhin als Meldung gezeigt. */
     char st[300];
-    if (gotJar)
+    if (gotJar) {
         snprintf(st, sizeof(st),
                  "Server pack ready  \x95  %d mods (+%d deps), %d configs, "
                  "Java %d  \x95  %s",
                  copiedMods, promoted, copiedCfg, reqJava, out);
-    else
+        /* im Servers-Tab merken */
+        char lname[80];
+        snprintf(lname, sizeof(lname), "%s %s", loaderName, loader);
+        servers_add(packName, out, mc, lname, copiedMods);
+        servers_fill_list();
+    } else
         snprintf(st, sizeof(st),
                  "Server pack incomplete - the loader could not be installed");
     prog_end(st);
@@ -3473,8 +3793,12 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_MEASUREITEM: {
         LPMEASUREITEMSTRUCT mi = (LPMEASUREITEMSTRUCT)lp;
-        if (mi->CtlType == ODT_LISTBOX)
-            mi->itemHeight = (gPickMode == 1) ? S(104) : S(34);
+        if (mi->CtlType == ODT_LISTBOX) {
+            if (mi->CtlID == 3001)          /* Server-Liste */
+                mi->itemHeight = S(54);
+            else
+                mi->itemHeight = (gPickMode == 1) ? S(104) : S(34);
+        }
         return TRUE;
     }
 
@@ -4215,6 +4539,185 @@ static void scan_from_edit(HWND hwnd)
 static int      list_index(HWND h);      /* fwd */
 static COLORREF list_accent(int i);      /* fwd */
 
+/* Icon zeichnen: entweder das geladene Bild, oder eine bunte Kachel mit
+ * den Anfangsbuchstaben des Namens - so bleibt kein leerer Kasten. */
+static void draw_icon_or_initials(HDC dc, RECT ic, HBITMAP bmp, const char *name)
+{
+    if (bmp) {
+        HDC md = CreateCompatibleDC(dc);
+        HGDIOBJ ob = SelectObject(md, bmp);
+        BITMAP bm;
+        GetObject(bmp, sizeof(bm), &bm);
+        SetStretchBltMode(dc, HALFTONE);
+        StretchBlt(dc, ic.left, ic.top, ic.right - ic.left,
+                   ic.bottom - ic.top, md, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+        SelectObject(md, ob);
+        DeleteDC(md);
+        return;
+    }
+    unsigned hash = 0;
+    for (const char *z = name; *z; z++)
+        hash = hash * 31u + (unsigned char)*z;
+    static const COLORREF pal[6] = {
+        RGB(96,165,250), RGB(74,222,128), RGB(167,139,250),
+        RGB(251,191,36), RGB(244,114,182), RGB(45,212,191) };
+    COLORREF ac = pal[hash % 6];
+    round_box(dc, ic, S(10), mix(CCARD, ac, 22), mix(CCARD, ac, 45));
+
+    char ini[3] = { 0, 0, 0 };
+    const char *z = name;
+    while (*z == ' ') z++;
+    if (*z) ini[0] = *z;
+    const char *sp2 = strchr(z, ' ');
+    if (sp2 && sp2[1]) ini[1] = sp2[1];
+    for (int k = 0; k < 2; k++)
+        if (ini[k] >= 'a' && ini[k] <= 'z')
+            ini[k] = (char)(ini[k] - 'a' + 'A');
+    HFONT big = CreateFontA(-((ic.bottom - ic.top) * 4 / 10), 0, 0, 0,
+                            FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                            CLEARTYPE_QUALITY, 0, "Segoe UI");
+    HGDIOBJ of = SelectObject(dc, big);
+    SetTextColor(dc, ac);
+    DrawTextA(dc, ini, -1, &ic,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, of);
+    DeleteObject(big);
+}
+
+/* ---- Home-Tab: Top-5 und Featured aus Modrinth laden ----
+ * Modrinth ohne Schluessel + zuverlaessige Downloadzahlen. Laeuft im
+ * Hintergrund, damit das Wechseln auf Home nicht blockiert. */
+#define WM_HOME_READY (WM_APP + 7)
+
+static void home_free(void)
+{
+    for (int i = 0; i < gHomeTopN; i++)
+        if (gHomeTop[i].icon) { DeleteObject(gHomeTop[i].icon); gHomeTop[i].icon = NULL; }
+    for (int i = 0; i < gHomeFeatN; i++)
+        if (gHomeFeat[i].icon) { DeleteObject(gHomeFeat[i].icon); gHomeFeat[i].icon = NULL; }
+    gHomeTopN = 0;
+    gHomeFeatN = 0;
+    gHomeIdx = 0;
+}
+
+static void home_parse(const char *json, Feature *out, int *nout, int max)
+{
+    int n = 0;
+    const char *e = json + strlen(json);
+    const char *p = strstr(json, "\"hits\"");
+    if (p) p = strchr(p, '[');
+    if (p) p++;
+    while (p && p < e && n < max) {
+        while (p < e && *p != '{' && *p != ']') p++;
+        if (p >= e || *p == ']') break;
+        const char *o = p;
+        int depth = 0, instr = 0;
+        for (; p < e; p++) {
+            char ch = *p;
+            if (instr) { if (ch == '\\') p++; else if (ch == '\"') instr = 0; }
+            else { if (ch == '\"') instr = 1; else if (ch == '{') depth++;
+                   else if (ch == '}') { depth--; if (depth == 0) { p++; break; } } }
+        }
+        Feature *f = &out[n];
+        memset(f, 0, sizeof(*f));
+        f->source = 1;
+        if (json_str(o, p, "title", f->name, sizeof(f->name)) &&
+            json_str(o, p, "slug", f->slug, sizeof(f->slug))) {
+            const char *d = strstr(o, "\"downloads\"");
+            if (d && d < p) {
+                const char *q = d + 11;
+                while (q < p && (*q == ' ' || *q == ':')) q++;
+                f->downloads = atoi(q);
+            }
+            json_str(o, p, "author", f->author, sizeof(f->author));
+            json_str(o, p, "description", f->desc, sizeof(f->desc));
+            json_str(o, p, "icon_url", f->iconUrl, sizeof(f->iconUrl));
+            utf8_fix(f->name, sizeof(f->name));
+            utf8_fix(f->author, sizeof(f->author));
+            utf8_fix(f->desc, sizeof(f->desc));
+            n++;
+        }
+        while (p < e && *p != ',' && *p != ']') p++;
+        if (p < e && *p == ',') p++;
+    }
+    *nout = n;
+}
+
+typedef struct { HWND wnd; } HomeLoadArg;
+
+static DWORD WINAPI home_load_thread(LPVOID param)
+{
+    HomeLoadArg *a = (HomeLoadArg *)param;
+
+    DWORD len = 0;
+    /* Top 5 nach Downloads */
+    char *r = https_request(L"api.modrinth.com", L"GET",
+                            L"/v2/search?facets=%5B%5B%22project_type:modpack%22%5D%5D"
+                            L"&limit=5&index=downloads",
+                            NULL, 0, &len);
+    if (r) {
+        home_parse(r, gHomeTop, &gHomeTopN, 5);
+        free(r);
+    }
+    /* Featured = follows-Sortierung */
+    r = https_request(L"api.modrinth.com", L"GET",
+                      L"/v2/search?facets=%5B%5B%22project_type:modpack%22%5D%5D"
+                      L"&limit=12&index=follows",
+                      NULL, 0, &len);
+    if (r) {
+        home_parse(r, gHomeFeat, &gHomeFeatN, 12);
+        free(r);
+    }
+
+    /* Icons synchron laden - im Hintergrund, blockiert das UI nicht */
+    for (int i = 0; i < gHomeTopN; i++)
+        if (gHomeTop[i].iconUrl[0])
+            gHomeTop[i].icon = load_icon(gHomeTop[i].iconUrl);
+    for (int i = 0; i < gHomeFeatN; i++)
+        if (gHomeFeat[i].iconUrl[0])
+            gHomeFeat[i].icon = load_icon(gHomeFeat[i].iconUrl);
+
+    gHomeLoaded = 1;
+    gHomeLoading = 0;
+    PostMessageA(a->wnd, WM_HOME_READY, 0, 0);
+    free(a);
+    return 0;
+}
+
+static void home_ensure_loaded(HWND wnd)
+{
+    if (gHomeLoaded || gHomeLoading) return;
+    gHomeLoading = 1;
+    HomeLoadArg *a = malloc(sizeof(HomeLoadArg));
+    a->wnd = wnd;
+    HANDLE h = CreateThread(NULL, 0, home_load_thread, a, 0, NULL);
+    if (h) CloseHandle(h); else { gHomeLoading = 0; free(a); }
+}
+
+/* Steuerelemente je nach Tab ein- oder ausblenden */
+static void apply_tab_visibility(void)
+{
+    int b = (gTab == TAB_BROWSE);
+    HWND browseWnd[] = { gBtnPick, gEditPath, gBtnChoose, gBtnScan,
+                         gBtnCopy, gBtnServer, gLblStatus,
+                         gListC, gListS, gListB, gListU };
+    for (int i = 0; i < 11; i++)
+        if (browseWnd[i])
+            ShowWindow(browseWnd[i], b ? SW_SHOW : SW_HIDE);
+
+    int s = (gTab == TAB_SERVERS);
+    if (gServerList)  ShowWindow(gServerList,  s ? SW_SHOW : SW_HIDE);
+    if (gServerTerm)  ShowWindow(gServerTerm,  s ? SW_SHOW : SW_HIDE);
+    if (gServerInput) ShowWindow(gServerInput, s ? SW_SHOW : SW_HIDE);
+    HWND sh[6] = {
+        GetDlgItem(gMainWnd, 3010), GetDlgItem(gMainWnd, 3011),
+        GetDlgItem(gMainWnd, 3012), GetDlgItem(gMainWnd, 3013),
+        GetDlgItem(gMainWnd, 3014), GetDlgItem(gMainWnd, 3015)
+    };
+    for (int i = 0; i < 6; i++)
+        if (sh[i]) ShowWindow(sh[i], s ? SW_SHOW : SW_HIDE);
+}
+
 static void layout(HWND hwnd)
 {
     RECT rc;
@@ -4222,53 +4725,96 @@ static void layout(HWND hwnd)
     int W = rc.right, H = rc.bottom;
     int m = S(16), gap = S(8), btnH = S(38);
 
-    /* --- obere Leiste: Modpack-Auswahl, Pfadfeld, dann Aktionen --- */
-    int bPick = S(170), bBrowse = S(142), bScan = S(104);
-    int ew = W - 2 * m - bPick - bBrowse - bScan - 3 * gap;
-    if (ew < S(120)) ew = S(120);
-    int x0 = m;
-    MoveWindow(gBtnPick, x0, m, bPick, btnH, TRUE);        x0 += bPick + gap;
+    /* --- Sidebar-Rechtecke fuer die Tabs ---
+     * Layout: Sidebar links (gSideW), rechts der jeweilige Tab-Inhalt. */
+    gContentLeft = gSideW;
+    int by0 = S(76);
+    for (int i = 0; i < 3; i++) {
+        gTabRect[i].left = S(10);
+        gTabRect[i].top = by0 + i * (S(48) + S(4));
+        gTabRect[i].right = gSideW - S(10);
+        gTabRect[i].bottom = gTabRect[i].top + S(48);
+    }
 
-    /* Rahmen so hoch wie die Buttons, das Feld selbst nur so hoch wie der
-     * Text und darin mittig - ein einzeiliges EDIT setzt seinen Text sonst
-     * immer nach oben. */
-    gEditBox.left = x0;  gEditBox.top = m;
-    gEditBox.right = x0 + ew;  gEditBox.bottom = m + btnH;
-    int eh = gTextH + S(4);
-    MoveWindow(gEditPath, x0 + S(2), m + (btnH - eh) / 2, ew - S(4), eh, TRUE);
-    x0 += ew + gap;
-    MoveWindow(gBtnChoose, x0, m, bBrowse, btnH, TRUE);    x0 += bBrowse + gap;
-    MoveWindow(gBtnScan, x0, m, bScan, btnH, TRUE);
+    /* Alles rechts der Sidebar */
+    int L = gContentLeft;
+    int contentW = W - L;
+    (void)contentW;
 
-    /* --- untere Leiste --- */
-    int by = H - m - btnH;
-    gBarY = by - S(14);
-    int bSrv = S(206), bCopy = S(228);
-    MoveWindow(gBtnServer, W - m - bSrv, by, bSrv, btnH, TRUE);
-    MoveWindow(gBtnCopy, W - m - bSrv - gap - bCopy, by, bCopy, btnH, TRUE);
-    int stw = W - m - bSrv - gap - bCopy - gap - m;
-    if (stw < S(40)) stw = S(40);
-    MoveWindow(gLblStatus, m, by + (btnH - S(18)) / 2, stw, S(18), TRUE);
+    apply_tab_visibility();
 
-    /* --- vier Karten --- */
-    gHdrH = S(42);
-    int cardTop = m + btnH + S(18);
-    int cardH = gBarY - S(14) - cardTop;
-    if (cardH < S(90)) cardH = S(90);
+    if (gTab == TAB_BROWSE) {
+        /* --- obere Leiste: Modpack-Auswahl, Pfadfeld, dann Aktionen --- */
+        int bPick = S(170), bBrowse = S(142), bScan = S(104);
+        int ew = W - L - m - m - bPick - bBrowse - bScan - 3 * gap;
+        if (ew < S(120)) ew = S(120);
+        int x0 = L + m;
+        MoveWindow(gBtnPick, x0, m, bPick, btnH, TRUE);        x0 += bPick + gap;
 
-    int colGap = S(12);
-    int colW = (W - 2 * m - 3 * colGap) / 4;
-    HWND lists[4] = { gListC, gListS, gListB, gListU };
-    int x = m;
-    for (int i = 0; i < 4; i++) {
-        gCard[i].left = x;
-        gCard[i].top = cardTop;
-        gCard[i].right = x + colW;
-        gCard[i].bottom = cardTop + cardH;
-        /* Liste sitzt innerhalb der Karte, Rand + runde Ecken bleiben sichtbar */
-        MoveWindow(lists[i], x + S(2), cardTop + gHdrH,
-                   colW - S(4), cardH - gHdrH - S(3), TRUE);
-        x += colW + colGap;
+        gEditBox.left = x0;  gEditBox.top = m;
+        gEditBox.right = x0 + ew;  gEditBox.bottom = m + btnH;
+        int eh = gTextH + S(4);
+        MoveWindow(gEditPath, x0 + S(2), m + (btnH - eh) / 2, ew - S(4), eh, TRUE);
+        x0 += ew + gap;
+        MoveWindow(gBtnChoose, x0, m, bBrowse, btnH, TRUE);    x0 += bBrowse + gap;
+        MoveWindow(gBtnScan, x0, m, bScan, btnH, TRUE);
+
+        /* --- untere Leiste --- */
+        int by = H - m - btnH;
+        gBarY = by - S(14);
+        int bSrv = S(206), bCopy = S(228);
+        MoveWindow(gBtnServer, W - m - bSrv, by, bSrv, btnH, TRUE);
+        MoveWindow(gBtnCopy, W - m - bSrv - gap - bCopy, by, bCopy, btnH, TRUE);
+        int stw = W - m - bSrv - gap - bCopy - gap - L - m;
+        if (stw < S(40)) stw = S(40);
+        MoveWindow(gLblStatus, L + m, by + (btnH - S(18)) / 2, stw, S(18), TRUE);
+
+        /* --- vier Karten --- */
+        gHdrH = S(42);
+        int cardTop = m + btnH + S(18);
+        int cardH = gBarY - S(14) - cardTop;
+        if (cardH < S(90)) cardH = S(90);
+
+        int colGap = S(12);
+        int colW = (W - L - 2 * m - 3 * colGap) / 4;
+        HWND lists[4] = { gListC, gListS, gListB, gListU };
+        int x = L + m;
+        for (int i = 0; i < 4; i++) {
+            gCard[i].left = x;
+            gCard[i].top = cardTop;
+            gCard[i].right = x + colW;
+            gCard[i].bottom = cardTop + cardH;
+            MoveWindow(lists[i], x + S(2), cardTop + gHdrH,
+                       colW - S(4), cardH - gHdrH - S(3), TRUE);
+            x += colW + colGap;
+        }
+    } else if (gTab == TAB_SERVERS) {
+        int listW = S(280);
+        MoveWindow(gServerList, L + m, m + S(46), listW, H - m - m - S(46), TRUE);
+        int tx = L + m + listW + gap;
+        int tw = W - tx - m;
+
+        /* Aktions-Buttons rechts oben */
+        int by0 = m + S(46);
+        int bw = S(96), bH = S(32);
+        HWND bs[6] = {
+            GetDlgItem(hwnd, 3010), GetDlgItem(hwnd, 3011),
+            GetDlgItem(hwnd, 3012), GetDlgItem(hwnd, 3013),
+            GetDlgItem(hwnd, 3014), GetDlgItem(hwnd, 3015)
+        };
+        int bx = tx;
+        for (int i = 0; i < 6; i++) {
+            if (bs[i]) MoveWindow(bs[i], bx, by0, bw, bH, TRUE);
+            bx += bw + S(6);
+        }
+
+        int termY = by0 + bH + S(12);
+        int termH = H - m - btnH - S(8) - termY;
+        if (termH < S(80)) termH = S(80);
+        MoveWindow(gServerTerm, tx, termY, tw, termH, TRUE);
+        MoveWindow(gServerInput, tx, H - m - btnH, tw, btnH, TRUE);
+    } else {
+        /* Home: nur gezeichnet */
     }
 }
 
@@ -4414,7 +4960,75 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         gListB = mk_list(hwnd, ID_LIST_BOTH);
         gListU = mk_list(hwnd, ID_LIST_UNKNOWN);
 
+        /* Servers-Tab: Liste links, Terminal + Eingabe rechts */
+        gServerList = CreateWindowExA(0, "LISTBOX", "",
+                                      WS_CHILD | WS_VSCROLL |
+                                      LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS |
+                                      LBS_OWNERDRAWFIXED | LBS_NOTIFY,
+                                      0, 0, 10, 10, hwnd,
+                                      (HMENU)3001, NULL, NULL);
+        SendMessageA(gServerList, WM_SETFONT, (WPARAM)gFont, TRUE);
+        SetWindowTheme(gServerList, L"DarkMode_Explorer", NULL);
+
+        LoadLibraryA("Msftedit.dll");
+        gServerTerm = CreateWindowExA(0, "RICHEDIT50W", "",
+                                      WS_CHILD | WS_VSCROLL |
+                                      ES_MULTILINE | ES_READONLY |
+                                      ES_AUTOVSCROLL,
+                                      0, 0, 10, 10, hwnd,
+                                      (HMENU)3002, NULL, NULL);
+        if (!gServerTerm)                 /* Rueckfall auf normales Edit */
+            gServerTerm = CreateWindowExA(0, "EDIT", "",
+                                          WS_CHILD | WS_VSCROLL |
+                                          ES_MULTILINE | ES_READONLY |
+                                          ES_AUTOVSCROLL,
+                                          0, 0, 10, 10, hwnd,
+                                          (HMENU)3002, NULL, NULL);
+        SendMessageA(gServerTerm, WM_SETFONT,
+                     (WPARAM)CreateFontA(-MulDiv(9, gDpi, 72), 0, 0, 0,
+                        FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                        CLEARTYPE_QUALITY, 0, "Consolas"), TRUE);
+        SetWindowTheme(gServerTerm, L"DarkMode_Explorer", NULL);
+        /* Farbe im RichEdit setzen */
+        CHARFORMAT2A cf;
+        ZeroMemory(&cf, sizeof(cf));
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR | CFM_BACKCOLOR;
+        cf.crTextColor = CTEXT;
+        cf.crBackColor = CCARD;
+        SendMessageA(gServerTerm, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+        SendMessageA(gServerTerm, EM_SETBKGNDCOLOR, 0, CCARD);
+
+        gServerInput = CreateWindowExA(0, "EDIT", "",
+                                       WS_CHILD | ES_AUTOHSCROLL,
+                                       0, 0, 10, 10, hwnd,
+                                       (HMENU)3003, NULL, NULL);
+        SendMessageA(gServerInput, WM_SETFONT, (WPARAM)gFont, TRUE);
+        SendMessageA(gServerInput, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(S(10), S(10)));
+        SetWindowTheme(gServerInput, L"DarkMode_CFD", NULL);
+        SendMessageA(gServerInput, EM_SETCUEBANNER, TRUE,
+                     (LPARAM)L"Server command (e.g. list, op <name>, stop) ...");
+
+        /* Server-Aktions-Buttons */
+        HWND bStart  = mk_button(hwnd, 3010, "Start");
+        HWND bStop   = mk_button(hwnd, 3011, "Stop");
+        HWND bKill   = mk_button(hwnd, 3012, "Kill");
+        HWND bOpen   = mk_button(hwnd, 3013, "Open folder");
+        HWND bClear  = mk_button(hwnd, 3014, "Clear log");
+        HWND bRemove = mk_button(hwnd, 3015, "Remove");
+        (void)bStart;(void)bStop;(void)bKill;(void)bOpen;(void)bClear;(void)bRemove;
+
+        SetTimer(hwnd, 1, 4500, NULL);       /* Karussell weiterschalten */
+
+        gServerInputOrig = (WNDPROC)SetWindowLongPtrA(gServerInput, GWLP_WNDPROC,
+                                                     (LONG_PTR)ServerInputProc);
+
+        servers_load();
+        servers_fill_list();
+
         layout(hwnd);
+        apply_tab_visibility();
 
         if (gMrpackUrl[0] && gServerOut[0]) {
             /* Online-Batch: Pack laden, scannen, Server bauen */
@@ -4448,8 +5062,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO *)lp;
-        mm->ptMinTrackSize.x = S(1000);
-        mm->ptMinTrackSize.y = S(460);
+        mm->ptMinTrackSize.x = S(1150);
+        mm->ptMinTrackSize.y = S(560);
         return 0;
     }
 
@@ -4475,20 +5089,205 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         FillRect(dc, &rc, gbrBg);
         SetBkMode(dc, TRANSPARENT);
 
-        /* Rahmen um das Eingabefeld (es hat selbst keinen mehr) */
-        round_box(dc, gEditBox, S(8), CINPUT,
-                  GetFocus() == gEditPath ? CACC : CBORDER);
+        /* ==== Sidebar ==== */
+        RECT sb = { 0, 0, gSideW, rc.bottom };
+        HBRUSH sbg = CreateSolidBrush(mix(CBG, CTEXT, 3));
+        FillRect(dc, &sb, sbg);
+        DeleteObject(sbg);
+        hline(dc, gSideW, gSideW + 1, 0, CBORDER);
+        RECT vb = { gSideW - 1, 0, gSideW, rc.bottom };
+        HBRUSH bo = CreateSolidBrush(CBORDER);
+        FillRect(dc, &vb, bo);
+        DeleteObject(bo);
 
-        static const char *titles[4] = { "Client-only", "Server-only",
-                                         "Server / Client", "Unknown" };
-        for (int i = 0; i < 4; i++)
-            draw_card(dc, i, titles[i]);
+        RECT title = { S(20), S(20), gSideW - S(10), S(50) };
+        SelectObject(dc, gFontB);
+        SetTextColor(dc, CTEXT);
+        DrawTextA(dc, "ModSorter", -1, &title, DT_LEFT | DT_TOP | DT_SINGLELINE);
 
-        hline(dc, S(16), rc.right - S(16), gBarY, CBORDER);
+        static const char *tabName[3] = { "Home", "Browse", "Servers" };
+        for (int i = 0; i < 3; i++) {
+            RECT t = gTabRect[i];
+            if (i == gTab)
+                round_box(dc, t, S(8), mix(CBG, CACC, 20), mix(CBG, CACC, 30));
+            SelectObject(dc, gFontB);
+            SetTextColor(dc, i == gTab ? CTEXT : CDIM);
+            RECT lbl = t;
+            lbl.left += S(20);
+            DrawTextA(dc, tabName[i], -1, &lbl,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
 
-        /* Fortschrittsbalken direkt ueber der unteren Leiste */
-        if (gBusy) {
-            RECT tr = { S(16), gBarY - S(9), rc.right - S(16), gBarY - S(3) };
+        if (gTab == TAB_BROWSE) {
+            round_box(dc, gEditBox, S(8), CINPUT,
+                      GetFocus() == gEditPath ? CACC : CBORDER);
+            static const char *titles[4] = { "Client-only", "Server-only",
+                                             "Server / Client", "Unknown" };
+            for (int i = 0; i < 4; i++)
+                draw_card(dc, i, titles[i]);
+            hline(dc, gContentLeft + S(16), rc.right - S(16), gBarY, CBORDER);
+        }
+        else if (gTab == TAB_HOME) {
+            int L = gContentLeft;
+            RECT hdr = { L + S(24), S(24), rc.right - S(24), S(60) };
+            SelectObject(dc, gFontB);
+            SetTextColor(dc, CTEXT);
+            DrawTextA(dc, "Top 5 Modpacks", -1, &hdr, DT_LEFT | DT_TOP | DT_SINGLELINE);
+
+            /* Karussell */
+            int cyTop = S(66);
+            int cyH = S(200);
+            RECT car = { L + S(20), cyTop, rc.right - S(20), cyTop + cyH };
+            round_box(dc, car, S(12), CCARD, CBORDER);
+
+            if (gHomeTopN > 0) {
+                int i = gHomeIdx % gHomeTopN;
+                Feature *f = &gHomeTop[i];
+                int isz = S(140);
+                RECT ic = { car.left + S(20), car.top + S(30),
+                            car.left + S(20) + isz, car.top + S(30) + isz };
+                draw_icon_or_initials(dc, ic, f->icon, f->name);
+
+                int tx = ic.right + S(24);
+                RECT tt = { tx, car.top + S(30), car.right - S(20), car.top + S(60) };
+                SelectObject(dc, gFontB);
+                SetTextColor(dc, CTEXT);
+                DrawTextA(dc, f->name, -1, &tt,
+                          DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+                char by[128];
+                snprintf(by, sizeof(by), "by %s", f->author);
+                RECT br = { tx, car.top + S(60), car.right - S(20), car.top + S(84) };
+                SelectObject(dc, gFontSm);
+                SetTextColor(dc, CMUTED);
+                DrawTextA(dc, by, -1, &br,
+                          DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+                RECT dr = { tx, car.top + S(92), car.right - S(20), car.bottom - S(60) };
+                SelectObject(dc, gFont);
+                SetTextColor(dc, CDIM);
+                DrawTextA(dc, f->desc, -1, &dr,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+                char dl[64];
+                if (f->downloads >= 1000000)
+                    snprintf(dl, sizeof(dl), "%.2fM Downloads", f->downloads/1e6);
+                else if (f->downloads >= 1000)
+                    snprintf(dl, sizeof(dl), "%.1fK Downloads", f->downloads/1e3);
+                else
+                    snprintf(dl, sizeof(dl), "%d Downloads", f->downloads);
+                RECT ddl = { car.right - S(200), car.bottom - S(30),
+                             car.right - S(20), car.bottom - S(10) };
+                SelectObject(dc, gFontB);
+                SetTextColor(dc, CACC);
+                DrawTextA(dc, dl, -1, &ddl,
+                          DT_RIGHT | DT_TOP | DT_SINGLELINE);
+                /* Punkte fuer die Position */
+                int dotW = S(8), dg = S(6);
+                int allW = gHomeTopN * dotW + (gHomeTopN - 1) * dg;
+                int dx = (car.left + car.right - allW) / 2;
+                int dy = car.bottom - S(18);
+                for (int k = 0; k < gHomeTopN; k++) {
+                    COLORREF c = (k == i) ? CACC : mix(CCARD, CTEXT, 20);
+                    dot(dc, dx + dotW/2, dy, dotW/2, c);
+                    dx += dotW + dg;
+                }
+            } else {
+                RECT lo = { car.left, car.top, car.right, car.bottom };
+                SelectObject(dc, gFont);
+                SetTextColor(dc, CMUTED);
+                DrawTextA(dc, gHomeLoading ? "Loading ..." :
+                          "Click Home again once online.", -1, &lo,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            /* Featured-Karten */
+            int fy = cyTop + cyH + S(24);
+            RECT fh2 = { L + S(24), fy, rc.right - S(24), fy + S(24) };
+            SelectObject(dc, gFontB);
+            SetTextColor(dc, CTEXT);
+            DrawTextA(dc, "Featured modpacks", -1, &fh2,
+                      DT_LEFT | DT_TOP | DT_SINGLELINE);
+            int gy = fy + S(34);
+            int cardW = (rc.right - L - S(40) - S(12) * 3) / 4;
+            int cardH2 = S(180);
+            for (int k = 0; k < gHomeFeatN && k < 8; k++) {
+                int col = k % 4, row = k / 4;
+                int cx = L + S(20) + col * (cardW + S(12));
+                int cy = gy + row * (cardH2 + S(12));
+                if (cy + cardH2 > rc.bottom - S(20)) break;
+                RECT cd = { cx, cy, cx + cardW, cy + cardH2 };
+                round_box(dc, cd, S(10), CCARD, CBORDER);
+                Feature *f = &gHomeFeat[k];
+                int isz = S(52);
+                RECT ic = { cd.left + S(14), cd.top + S(14),
+                            cd.left + S(14) + isz, cd.top + S(14) + isz };
+                draw_icon_or_initials(dc, ic, f->icon, f->name);
+                RECT tt = { ic.right + S(10), cd.top + S(14),
+                            cd.right - S(10), cd.top + S(34) };
+                SelectObject(dc, gFontB);
+                SetTextColor(dc, CTEXT);
+                DrawTextA(dc, f->name, -1, &tt,
+                          DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+                RECT ar = { ic.right + S(10), cd.top + S(34),
+                            cd.right - S(10), cd.top + S(52) };
+                SelectObject(dc, gFontSm);
+                SetTextColor(dc, CMUTED);
+                DrawTextA(dc, f->author, -1, &ar,
+                          DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+                RECT dr = { cd.left + S(14), cd.top + S(76),
+                            cd.right - S(14), cd.bottom - S(30) };
+                SelectObject(dc, gFont);
+                SetTextColor(dc, CDIM);
+                DrawTextA(dc, f->desc, -1, &dr,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+                char dl[48];
+                if (f->downloads >= 1000000)
+                    snprintf(dl, sizeof(dl), "%.1fM Downloads", f->downloads/1e6);
+                else if (f->downloads >= 1000)
+                    snprintf(dl, sizeof(dl), "%.1fK Downloads", f->downloads/1e3);
+                else
+                    snprintf(dl, sizeof(dl), "%d Downloads", f->downloads);
+                RECT ddl = { cd.left + S(14), cd.bottom - S(24),
+                             cd.right - S(14), cd.bottom - S(8) };
+                SelectObject(dc, gFontSm);
+                SetTextColor(dc, CACC);
+                DrawTextA(dc, dl, -1, &ddl,
+                          DT_LEFT | DT_TOP | DT_SINGLELINE);
+            }
+        }
+        else if (gTab == TAB_SERVERS) {
+            int L = gContentLeft;
+            RECT hdr = { L + S(24), S(24), rc.right - S(24), S(60) };
+            SelectObject(dc, gFontB);
+            SetTextColor(dc, CTEXT);
+            char h[80];
+            snprintf(h, sizeof(h), "Servers  \x95  %d", gServersN);
+            DrawTextA(dc, h, -1, &hdr, DT_LEFT | DT_TOP | DT_SINGLELINE);
+
+            /* Server-Details rechts oben */
+            int listW = S(280);
+            int tx = L + S(16) + listW + S(8);
+            RECT db = { tx, S(60), rc.right - S(16), S(96) };
+            if (gServerSel >= 0 && gServerSel < gServersN) {
+                ServerEntry *s = &gServers[gServerSel];
+                char info[300];
+                snprintf(info, sizeof(info), "%s", s->name);
+                SelectObject(dc, gFontB);
+                SetTextColor(dc, CTEXT);
+                DrawTextA(dc, info, -1, &db,
+                          DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+                snprintf(info, sizeof(info), "%s  \x95  %s  \x95  %d mods  \x95  %s",
+                         s->mc, s->loader, s->mods, s->path);
+                RECT db2 = db;
+                db2.top += S(22);
+                SelectObject(dc, gFontSm);
+                SetTextColor(dc, CMUTED);
+                DrawTextA(dc, info, -1, &db2,
+                          DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+        }
+
+        /* Fortschrittsbalken direkt ueber der unteren Leiste (nur Browse) */
+        if (gBusy && gTab == TAB_BROWSE) {
+            RECT tr = { gContentLeft + S(16), gBarY - S(9), rc.right - S(16), gBarY - S(3) };
             round_box(dc, tr, S(3), mix(CBG, CTEXT, 8), mix(CBG, CTEXT, 12));
             if (gProgFrac >= 0.0) {
                 double f = gProgFrac > 1.0 ? 1.0 : gProgFrac;
@@ -4521,6 +5320,60 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_LBUTTONDOWN: {
+        int x = LOWORD(lp), y = HIWORD(lp);
+        POINT pt = { x, y };
+        for (int i = 0; i < 3; i++) {
+            if (PtInRect(&gTabRect[i], pt)) {
+                if (gTab != i) {
+                    gTab = i;
+                    layout(hwnd);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    if (gTab == TAB_HOME)
+                        home_ensure_loaded(hwnd);
+                }
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wp == 1 && gTab == TAB_HOME && gHomeTopN > 0) {
+            gHomeIdx = (gHomeIdx + 1) % gHomeTopN;
+            /* nur den Karussell-Bereich neu zeichnen */
+            RECT rc; GetClientRect(hwnd, &rc);
+            RECT car = { gContentLeft + S(20), S(66),
+                         rc.right - S(20), S(66) + S(200) };
+            InvalidateRect(hwnd, &car, FALSE);
+        }
+        return 0;
+
+    case WM_HOME_READY:
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_TERM_APPEND: {
+        char *s = (char *)lp;
+        if (s) {
+            /* Text ans Ende anhaengen */
+            int len = GetWindowTextLengthA(gServerTerm);
+            SendMessageA(gServerTerm, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+            SendMessageA(gServerTerm, EM_REPLACESEL, FALSE, (LPARAM)s);
+            SendMessageA(gServerTerm, WM_VSCROLL, SB_BOTTOM, 0);
+            free(s);
+        }
+        return 0;
+    }
+
+    case WM_TERM_EXIT:
+        if (gServerProc) { CloseHandle(gServerProc); gServerProc = NULL; }
+        if (gServerStdIn) { CloseHandle(gServerStdIn); gServerStdIn = NULL; }
+        SendMessageA(gServerTerm, EM_SETSEL, -1, -1);
+        SendMessageA(gServerTerm, EM_REPLACESEL, FALSE,
+                     (LPARAM)"\r\n[server stopped]\r\n");
+        return 0;
+
     case WM_CTLCOLORLISTBOX: {
         HDC dc = (HDC)wp;
         SetTextColor(dc, CDIM);
@@ -4551,6 +5404,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DRAWITEM: {
         LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
+
+        /* ---- Server-Liste ---- */
+        if (d->CtlType == ODT_LISTBOX && d->CtlID == 3001) {
+            if ((int)d->itemID < 0 || (int)d->itemID >= gServersN)
+                return TRUE;
+            int sel = (d->itemState & ODS_SELECTED) != 0;
+            RECT r = d->rcItem;
+            HBRUSH bg = CreateSolidBrush(sel ? mix(CCARD, CACC, 16) : CCARD);
+            FillRect(d->hDC, &r, bg);
+            DeleteObject(bg);
+            if (sel) {
+                RECT b = { r.left, r.top + S(4), r.left + S(3), r.bottom - S(4) };
+                HBRUSH ab = CreateSolidBrush(CACC);
+                FillRect(d->hDC, &b, ab);
+                DeleteObject(ab);
+            }
+            ServerEntry *s = &gServers[d->itemID];
+            SetBkMode(d->hDC, TRANSPARENT);
+            RECT tt = { r.left + S(14), r.top + S(6), r.right - S(10),
+                        r.top + S(28) };
+            SelectObject(d->hDC, gFontB);
+            SetTextColor(d->hDC, CTEXT);
+            DrawTextA(d->hDC, s->name, -1, &tt,
+                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+            RECT br = { r.left + S(14), r.top + S(28), r.right - S(10),
+                        r.top + S(48) };
+            char sub[128];
+            snprintf(sub, sizeof(sub), "%s  \x95  %s", s->mc, s->loader);
+            SelectObject(d->hDC, gFontSm);
+            SetTextColor(d->hDC, CMUTED);
+            DrawTextA(d->hDC, sub, -1, &br,
+                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+            return TRUE;
+        }
 
         /* ---- Listeneintrag ---- */
         if (d->CtlType == ODT_LISTBOX) {
@@ -4740,10 +5627,60 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_BTN_SERVER:
             create_server_pack(hwnd);
             return 0;
+
+        /* --- Servers-Tab --- */
+        case 3001:                       /* Auswahl in der Server-Liste */
+            if (HIWORD(wp) == LBN_SELCHANGE) {
+                int i = (int)SendMessageA(gServerList, LB_GETCURSEL, 0, 0);
+                gServerSel = i;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case 3010:                       /* Start */
+            if (gServerSel >= 0 && gServerSel < gServersN) {
+                SetWindowTextA(gServerTerm, "");
+                if (server_start(gServers[gServerSel].path, hwnd)) {
+                    SetFocus(gServerInput);
+                } else {
+                    MessageBoxA(hwnd,
+                                "Could not start the server. Is start.bat present?",
+                                "ModSorter", MB_OK | MB_ICONERROR);
+                }
+            }
+            return 0;
+        case 3011:                       /* Stop */
+            server_stop();
+            return 0;
+        case 3012:                       /* Kill */
+            server_kill();
+            SendMessageA(gServerTerm, EM_SETSEL, -1, -1);
+            SendMessageA(gServerTerm, EM_REPLACESEL, FALSE,
+                         (LPARAM)"\r\n[server killed]\r\n");
+            return 0;
+        case 3013:                       /* Ordner oeffnen */
+            if (gServerSel >= 0 && gServerSel < gServersN)
+                ShellExecuteA(hwnd, "open", gServers[gServerSel].path,
+                              NULL, NULL, SW_SHOW);
+            return 0;
+        case 3014:                       /* Log leeren */
+            SetWindowTextA(gServerTerm, "");
+            return 0;
+        case 3015:                       /* aus der Liste entfernen */
+            if (gServerSel >= 0 && gServerSel < gServersN) {
+                for (int i = gServerSel; i < gServersN - 1; i++)
+                    gServers[i] = gServers[i + 1];
+                gServersN--;
+                servers_save();
+                servers_fill_list();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
         }
         break;
 
     case WM_DESTROY:
+        server_kill();
+        KillTimer(hwnd, 1);
         PostQuitMessage(0);
         return 0;
     }
@@ -4852,7 +5789,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
         0, "ModSorterWin",
         "ModSorter  -  Client/Server Mod Sorter (Fabric / NeoForge / Forge)",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, S(1260), S(660),
+        CW_USEDEFAULT, CW_USEDEFAULT, S(1400), S(720),
         NULL, NULL, hInst, NULL);
 
     ShowWindow(hwnd, show);
