@@ -6,6 +6,9 @@
 *.res
 *.manifest
 
+# Persoenlicher CurseForge-Schluessel - gehoert NICHT ins Repository
+curseforge.key
+
 # Testausgaben
 /server/
 /client/

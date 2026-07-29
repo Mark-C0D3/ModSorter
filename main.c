@@ -95,6 +95,7 @@ static char   gFolder[MAX_PATH] = "";
 static char   gStartPath[MAX_PATH] = "";   /* optionaler Ordner von der Kommandozeile */
 static char   gServerOut[MAX_PATH] = "";   /* --server <ziel>: Batch-Modus */
 static char   gMrpackUrl[900] = "";        /* --mrpack <url>: Online-Batch */
+static int    gPackIsCf = 0;               /* --cfpack statt --mrpack */
 static int    gAutoQuit = 0;
 static HWND   gBtnChoose, gBtnCopy, gBtnScan, gBtnServer, gBtnPick, gEditPath;
 static HWND   gListC, gListS, gListB, gListU;
@@ -566,10 +567,47 @@ static int sha1_file(const char *path, char out_hex[41])
     return 1;
 }
 
-/* HTTPS-Anfrage an api.modrinth.com; gibt malloc'd Body zurueck (oder NULL) */
+/* CurseForge-Schluessel aus der Datei neben der exe.
+ * Bewusst nicht im Quelltext - der ist oeffentlich, der Schluessel privat. */
+static char gCfKey[96] = "";
+
+static void load_cf_key(void)
+{
+    char p[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, p, MAX_PATH))
+        return;
+    char *sl = strrchr(p, '\\');
+    if (!sl) return;
+    strcpy(sl + 1, "curseforge.key");
+
+    FILE *f = fopen(p, "rb");
+    if (!f) return;
+    size_t n = fread(gCfKey, 1, sizeof(gCfKey) - 1, f);
+    fclose(f);
+    gCfKey[n] = 0;
+    while (n > 0 && (gCfKey[n-1] == '\n' || gCfKey[n-1] == '\r' ||
+                     gCfKey[n-1] == ' ' || gCfKey[n-1] == '\t'))
+        gCfKey[--n] = 0;
+}
+
+/* HTTPS-Anfrage; extra = zusaetzliche Kopfzeilen (oder NULL).
+ * Gibt malloc'd Body zurueck (oder NULL). */
+static char *https_request_hdr(const wchar_t *host, const wchar_t *verb,
+                               const wchar_t *path, const char *body,
+                               int bodyLen, DWORD *outLen,
+                               const wchar_t *extra);
+
 static char *https_request(const wchar_t *host, const wchar_t *verb,
                            const wchar_t *path, const char *body,
                            int bodyLen, DWORD *outLen)
+{
+    return https_request_hdr(host, verb, path, body, bodyLen, outLen, NULL);
+}
+
+static char *https_request_hdr(const wchar_t *host, const wchar_t *verb,
+                               const wchar_t *path, const char *body,
+                               int bodyLen, DWORD *outLen,
+                               const wchar_t *extra)
 {
     char *result = NULL;
     DWORD total = 0;
@@ -586,9 +624,14 @@ static char *https_request(const wchar_t *host, const wchar_t *verb,
                                          WINHTTP_DEFAULT_ACCEPT_TYPES,
                                          WINHTTP_FLAG_SECURE);
         if (r) {
-            const wchar_t *hdr = body ? L"Content-Type: application/json\r\n"
-                                      : WINHTTP_NO_ADDITIONAL_HEADERS;
-            DWORD hdrLen = body ? (DWORD)-1L : 0;
+            wchar_t hdrBuf[400];
+            hdrBuf[0] = 0;
+            if (body)
+                wcscat(hdrBuf, L"Content-Type: application/json\r\n");
+            if (extra)
+                wcsncat(hdrBuf, extra, 380 - wcslen(hdrBuf));
+            const wchar_t *hdr = hdrBuf[0] ? hdrBuf : WINHTTP_NO_ADDITIONAL_HEADERS;
+            DWORD hdrLen = hdrBuf[0] ? (DWORD)-1L : 0;
             BOOL ok = WinHttpSendRequest(r, hdr, hdrLen, (LPVOID)body,
                                          body ? bodyLen : 0,
                                          body ? bodyLen : 0, 0);
@@ -2832,8 +2875,10 @@ typedef struct {
     char name[96];        /* version_number */
     char mc[32];          /* erste game_version */
     char loader[24];      /* erster loader */
-    char url[700];        /* Download der .mrpack */
+    char url[700];        /* Download der .mrpack bzw. der CurseForge-Zip */
     char filename[200];
+    int  cfFileId;        /* nur CurseForge */
+    int  cfModId;
 } PackVersion;
 
 static PackVersion *gVer = NULL;
@@ -2892,6 +2937,183 @@ static int modrinth_versions(const char *slug)
     return gVerN;
 }
 
+/* Anfrage an api.curseforge.com mit Schluessel */
+static char *cf_request(const char *path, const char *body, DWORD *outLen)
+{
+    if (!gCfKey[0])
+        return NULL;
+    wchar_t wp[900], hdr[200];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 900);
+    wchar_t wkey[128];
+    MultiByteToWideChar(CP_UTF8, 0, gCfKey, -1, wkey, 128);
+    _snwprintf(hdr, 200, L"x-api-key: %s\r\nAccept: application/json\r\n", wkey);
+    return https_request_hdr(L"api.curseforge.com", body ? L"POST" : L"GET",
+                             wp, body, body ? (int)strlen(body) : 0, outLen, hdr);
+}
+
+/* Modpacks bei CurseForge suchen und an gInst anhaengen */
+static void search_curseforge(const char *query)
+{
+    if (!gCfKey[0])
+        return;
+    char q[512];
+    url_encode(query, q, sizeof(q));
+    char path[800];
+    snprintf(path, sizeof(path),
+             "/v1/mods/search?gameId=432&classId=4471&searchFilter=%s"
+             "&pageSize=20&sortField=2&sortOrder=desc", q);
+
+    DWORD len = 0;
+    char *r = cf_request(path, NULL, &len);
+    if (!r)
+        return;
+
+    const char *e = r + len;
+    const char *p = strstr(r, "\"data\"");
+    if (p) p = strchr(p, '[');
+    if (p) p++;
+    while (p && p < e) {
+        while (p < e && *p != '{' && *p != ']') p++;
+        if (p >= e || *p == ']') break;
+        const char *o = p;
+        int depth = 0, instr = 0;
+        for (; p < e; p++) {
+            char ch = *p;
+            if (instr) { if (ch == '\\') p++; else if (ch == '\"') instr = 0; }
+            else { if (ch == '\"') instr = 1; else if (ch == '{') depth++;
+                   else if (ch == '}') { depth--; if (depth == 0) { p++; break; } } }
+        }
+
+        char name[128];
+        if (!json_str(o, p, "name", name, sizeof(name)))
+            continue;
+        int id = 0;
+        const char *ip = strstr(o, "\"id\"");
+        if (ip && ip < p) {
+            const char *q2 = ip + 4;
+            while (q2 < p && (*q2 == ' ' || *q2 == ':')) q2++;
+            id = atoi(q2);
+        }
+        if (!id)
+            continue;
+
+        if (gInstN >= gInstCap) {
+            gInstCap = gInstCap ? gInstCap * 2 : 32;
+            gInst = (Instance *)realloc(gInst, sizeof(Instance) * gInstCap);
+        }
+        Instance *it = &gInst[gInstN++];
+        memset(it, 0, sizeof(*it));
+        strcpy(it->launcher, "CurseForge");
+        strncpy(it->name, name, 127); it->name[127] = 0;
+        snprintf(it->path, MAX_PATH, "%d", id);
+        it->online = 2;
+
+        const char *dp = strstr(o, "\"downloadCount\"");
+        if (dp && dp < p) {
+            const char *q2 = dp + 15;
+            while (q2 < p && (*q2 == ' ' || *q2 == ':')) q2++;
+            it->mods = atoi(q2);
+        }
+        json_str(o, p, "summary", it->desc, sizeof(it->desc));
+        /* Autor: erster Eintrag in "authors" */
+        const char *ap = strstr(o, "\"authors\"");
+        if (ap && ap < p)
+            json_str(ap, p, "name", it->author, sizeof(it->author));
+        char dt[40];
+        if (json_str(o, p, "dateModified", dt, sizeof(dt))) {
+            strncpy(it->updated, dt, 10);
+            it->updated[10] = 0;
+        }
+        utf8_fix(it->name, sizeof(it->name));
+        utf8_fix(it->author, sizeof(it->author));
+        utf8_fix(it->desc, sizeof(it->desc));
+
+        /* Logo */
+        const char *lp = strstr(o, "\"logo\"");
+        if (lp && lp < p) {
+            char iconUrl[500];
+            if (json_str(lp, p, "url", iconUrl, sizeof(iconUrl)) && iconUrl[0])
+                it->icon = load_icon(iconUrl);
+        }
+
+        while (p < e && *p != ',' && *p != ']') p++;
+        if (p < e && *p == ',') p++;
+    }
+    free(r);
+}
+
+/* Dateien (Versionen) eines CurseForge-Modpacks holen */
+static int curseforge_versions(int modId)
+{
+    gVerN = 0;
+    char path[200];
+    snprintf(path, sizeof(path), "/v1/mods/%d/files?pageSize=50", modId);
+    DWORD len = 0;
+    char *r = cf_request(path, NULL, &len);
+    if (!r)
+        return 0;
+
+    const char *e = r + len;
+    const char *p = strstr(r, "\"data\"");
+    if (p) p = strchr(p, '[');
+    if (p) p++;
+    while (p && p < e) {
+        while (p < e && *p != '{' && *p != ']') p++;
+        if (p >= e || *p == ']') break;
+        const char *o = p;
+        int depth = 0, instr = 0;
+        for (; p < e; p++) {
+            char ch = *p;
+            if (instr) { if (ch == '\\') p++; else if (ch == '\"') instr = 0; }
+            else { if (ch == '\"') instr = 1; else if (ch == '{') depth++;
+                   else if (ch == '}') { depth--; if (depth == 0) { p++; break; } } }
+        }
+
+        char disp[96];
+        if (!json_str(o, p, "displayName", disp, sizeof(disp)))
+            continue;
+        int fid = 0;
+        const char *ip = strstr(o, "\"id\"");
+        if (ip && ip < p) {
+            const char *q2 = ip + 4;
+            while (q2 < p && (*q2 == ' ' || *q2 == ':')) q2++;
+            fid = atoi(q2);
+        }
+        if (!fid) continue;
+
+        if (gVerN >= gVerCap) {
+            gVerCap = gVerCap ? gVerCap * 2 : 32;
+            gVer = (PackVersion *)realloc(gVer, sizeof(PackVersion) * gVerCap);
+        }
+        PackVersion *v = &gVer[gVerN++];
+        memset(v, 0, sizeof(*v));
+        strncpy(v->name, disp, 95); v->name[95] = 0;
+        utf8_fix(v->name, sizeof(v->name));
+        v->cfFileId = fid;
+        v->cfModId = modId;
+        json_str(o, p, "fileName", v->filename, sizeof(v->filename));
+        json_str(o, p, "downloadUrl", v->url, sizeof(v->url));
+
+        /* gameVersions enthaelt MC-Version und Loader gemischt */
+        char gv[12][64];
+        int ng = json_str_array(o, p, "gameVersions", gv, 12);
+        strcpy(v->mc, "?");
+        strcpy(v->loader, "?");
+        for (int i = 0; i < ng; i++) {
+            if (gv[i][0] >= '0' && gv[i][0] <= '9') {
+                if (strcmp(v->mc, "?") == 0) { strncpy(v->mc, gv[i], 31); v->mc[31] = 0; }
+            } else if (_stricmp(gv[i], "Forge") == 0 || _stricmp(gv[i], "Fabric") == 0 ||
+                       _stricmp(gv[i], "NeoForge") == 0 || _stricmp(gv[i], "Quilt") == 0) {
+                strncpy(v->loader, gv[i], 23); v->loader[23] = 0;
+            }
+        }
+        while (p < e && *p != ',' && *p != ']') p++;
+        if (p < e && *p == ',') p++;
+    }
+    free(r);
+    return gVerN;
+}
+
 #define ID_PICK_LIST   2001
 #define ID_PICK_LOAD   2002
 #define ID_PICK_SERVER 2003
@@ -2905,6 +3127,7 @@ static int  gPickMode = 0;
 static char gPickSlug[128] = "", gPickName[128] = "";
 static char gPickUrl[700] = "";
 static int  gPickOnlineResult = 0;
+static int  gPickSource = 1;          /* 1 = Modrinth, 2 = CurseForge */
 static HWND gPickSearch = NULL;
 static WNDPROC gSearchOrig = NULL;
 
@@ -2977,8 +3200,10 @@ static void pick_finish(HWND hwnd, int server)
         if (idx < 0 || idx >= gInstN) return;
         strncpy(gPickSlug, gInst[idx].path, 127); gPickSlug[127] = 0;
         strncpy(gPickName, gInst[idx].name, 127); gPickName[127] = 0;
+        gPickSource = gInst[idx].online;   /* 1 = Modrinth, 2 = CurseForge */
         SetCursor(LoadCursor(NULL, IDC_WAIT));
-        int n = modrinth_versions(gPickSlug);
+        int n = (gPickSource == 2) ? curseforge_versions(atoi(gPickSlug))
+                                   : modrinth_versions(gPickSlug);
         SetCursor(LoadCursor(NULL, IDC_ARROW));
         if (n <= 0) {
             MessageBoxA(hwnd, "No versions found.", "ModSorter",
@@ -3302,7 +3527,8 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 enum_instances();
             } else {
                 SetCursor(LoadCursor(NULL, IDC_WAIT));
-                search_modrinth(s);
+                search_modrinth(s);          /* setzt gInstN zurueck */
+                search_curseforge(s);        /* haengt an */
                 SetCursor(LoadCursor(NULL, IDC_ARROW));
                 gPickMode = 1;
             }
@@ -3579,6 +3805,125 @@ static int download_mrpack(HWND hwnd, const char *url, const char *dest)
     return !gCancel && done > 0;
 }
 
+/* Ein CurseForge-Modpack laden und in dest auspacken.
+ * Format: ZIP mit manifest.json (Liste aus projectID/fileID) und overrides\.
+ * Die Download-Links muessen einzeln aufgeloest werden; wo der Autor die
+ * Weitergabe gesperrt hat, liefert die API keinen Link - solche Dateien
+ * werden uebersprungen und am Ende aufgelistet. */
+static int download_cfpack(HWND hwnd, const char *url, const char *dest,
+                           char *blockedOut, int blockedSz, int *blockedN)
+{
+    (void)hwnd;
+    CreateDirectoryA(dest, NULL);
+    char pack[MAX_PATH];
+    snprintf(pack, sizeof(pack), "%s\\pack.zip", dest);
+
+    prog_begin("Downloading modpack ...");
+    snprintf(gLabel, sizeof(gLabel), "Modpack archive");
+    if (!download_url(url, pack)) {
+        gLabel[0] = 0;
+        prog_end(gCancel ? "Cancelled." : "Error: could not download the modpack");
+        return 0;
+    }
+    gLabel[0] = 0;
+
+    prog_set("Extracting modpack ...", -1.0, 1);
+    char cmd[1400];
+    snprintf(cmd, sizeof(cmd), "tar.exe -xf \"%s\" -C \"%s\" overrides", pack, dest);
+    run_wait(cmd, dest, 300000);
+    char ov[MAX_PATH];
+    snprintf(ov, sizeof(ov), "%s\\overrides", dest);
+    if (GetFileAttributesA(ov) != INVALID_FILE_ATTRIBUTES) {
+        copy_tree(ov, dest);
+        snprintf(cmd, sizeof(cmd), "cmd.exe /c rmdir /s /q \"%s\"", ov);
+        run_wait(cmd, dest, 60000);
+    }
+
+    snprintf(cmd, sizeof(cmd), "tar.exe -xOf \"%s\" manifest.json", pack);
+    char *man = run_capture(cmd);
+    if (!man) {
+        prog_end("Error: manifest.json is missing from the pack");
+        DeleteFileA(pack);
+        return 0;
+    }
+
+    /* projectID/fileID-Paare einsammeln */
+    int cap = 256, n = 0;
+    int (*ids)[2] = malloc(sizeof(*ids) * cap);
+    const char *e = man + strlen(man);
+    for (const char *p = man; (p = strstr(p, "\"projectID\"")) != NULL; ) {
+        int pid = 0, fid = 0;
+        const char *q = p + 11;
+        while (q < e && (*q == ' ' || *q == ':')) q++;
+        pid = atoi(q);
+        const char *fp = strstr(q, "\"fileID\"");
+        if (fp) {
+            q = fp + 8;
+            while (q < e && (*q == ' ' || *q == ':')) q++;
+            fid = atoi(q);
+        }
+        if (pid && fid) {
+            if (n >= cap) { cap *= 2; ids = realloc(ids, sizeof(*ids) * cap); }
+            ids[n][0] = pid; ids[n][1] = fid; n++;
+        }
+        p = fp ? fp + 8 : p + 11;
+    }
+    free(man);
+
+    char mods[MAX_PATH];
+    snprintf(mods, sizeof(mods), "%s\\mods", dest);
+    CreateDirectoryA(mods, NULL);
+
+    int done = 0, blocked = 0;
+    if (blockedN) *blockedN = 0;
+    if (blockedOut && blockedSz) blockedOut[0] = 0;
+
+    for (int i = 0; i < n && !gCancel; i++) {
+        /* Datei-Info holen: Name und Download-Link */
+        char path[128];
+        snprintf(path, sizeof(path), "/v1/mods/%d/files/%d", ids[i][0], ids[i][1]);
+        DWORD rl = 0;
+        char *fr = cf_request(path, NULL, &rl);
+        if (!fr) continue;
+
+        char fname[200] = "", furl[900] = "";
+        json_str(fr, fr + rl, "fileName", fname, sizeof(fname));
+        json_str(fr, fr + rl, "downloadUrl", furl, sizeof(furl));
+        free(fr);
+
+        if (!fname[0]) continue;
+
+        snprintf(gLabel, sizeof(gLabel), "[%d/%d] %s", i + 1, n, fname);
+        prog_set(gLabel, (double)i / n, 1);
+
+        if (!furl[0]) {                 /* Autor hat die Weitergabe gesperrt */
+            blocked++;
+            if (blockedOut && (int)strlen(blockedOut) + 220 < blockedSz) {
+                char line[220];
+                snprintf(line, sizeof(line), "  %s\n", fname);
+                strcat(blockedOut, line);
+            }
+            continue;
+        }
+        char full[MAX_PATH];
+        snprintf(full, sizeof(full), "%s\\%s", mods, fname);
+        if (download_url(furl, full)) done++;
+    }
+    free(ids);
+    DeleteFileA(pack);
+    gLabel[0] = 0;
+    if (blockedN) *blockedN = blocked;
+
+    char st[260];
+    if (gCancel)
+        snprintf(st, sizeof(st), "Cancelled - %d of %d mods downloaded", done, n);
+    else
+        snprintf(st, sizeof(st), "Modpack downloaded: %d of %d mods%s",
+                 done, n, blocked ? " (some blocked by their authors)" : "");
+    prog_end(st);
+    return !gCancel && done > 0;
+}
+
 static void choose_folder(HWND hwnd)
 {
     /* Dialog dort oeffnen, wo der aktuelle Pfad hinzeigt */
@@ -3835,7 +4180,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             CreateDirectoryA(gServerOut, NULL);
             snprintf(packDir, sizeof(packDir), "%s\\modpack", gServerOut);
             snprintf(srvDir, sizeof(srvDir), "%s\\server", gServerOut);
-            if (download_mrpack(hwnd, gMrpackUrl, packDir)) {
+            static char blk[4000];
+            int nblk = 0;
+            int got = gPackIsCf
+                ? download_cfpack(hwnd, gMrpackUrl, packDir, blk, sizeof(blk), &nblk)
+                : download_mrpack(hwnd, gMrpackUrl, packDir);
+            if (got) {
                 snprintf(gFolder, MAX_PATH, "%s\\mods", packDir);
                 SetWindowTextA(gEditPath, gFolder);
                 scan_folder(hwnd);
@@ -4071,7 +4421,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 snprintf(srvDir, sizeof(srvDir), "%s\\server", base);
 
                 SetCursor(LoadCursor(NULL, IDC_WAIT));
-                int ok = download_mrpack(hwnd, gPickUrl, packDir);
+                static char blocked[4000];
+                int nBlocked = 0;
+                int ok = (gPickSource == 2)
+                    ? download_cfpack(hwnd, gPickUrl, packDir,
+                                      blocked, sizeof(blocked), &nBlocked)
+                    : download_mrpack(hwnd, gPickUrl, packDir);
                 SetCursor(LoadCursor(NULL, IDC_ARROW));
                 if (!ok) {
                     MessageBoxA(hwnd,
@@ -4079,6 +4434,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 "Please check your internet connection.",
                                 "ModSorter", MB_OK | MB_ICONERROR);
                     return 0;
+                }
+                if (nBlocked > 0) {
+                    char msg[4400];
+                    snprintf(msg, sizeof(msg),
+                             "%d mod(s) could not be downloaded because their\n"
+                             "authors disabled third-party distribution.\n\n"
+                             "Please download these from the CurseForge website\n"
+                             "and put them into the mods folder yourself:\n\n%s",
+                             nBlocked, blocked);
+                    MessageBoxA(hwnd, msg, "ModSorter", MB_OK | MB_ICONWARNING);
                 }
                 snprintf(gFolder, MAX_PATH, "%s\\mods", packDir);
                 SetWindowTextA(gEditPath, gFolder);
@@ -4138,6 +4503,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
     icc.dwICC = ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
     enable_dark_controls();
+    load_cf_key();
 
     GdiplusStartupInput_ gsi;
     ZeroMemory(&gsi, sizeof(gsi));
@@ -4163,6 +4529,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
             strncpy(copy, line, sizeof(copy) - 1);
             copy[sizeof(copy) - 1] = 0;
             char *mp = strstr(copy, "--mrpack");
+            if (!mp) {
+                mp = strstr(copy, "--cfpack");
+                if (mp) gPackIsCf = 1;
+            }
             if (mp) {
                 char *u = mp + 8;
                 char *stop = strstr(u, " --");
@@ -4174,7 +4544,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
                 while (ul > 0 && (gMrpackUrl[ul-1] == ' ' || gMrpackUrl[ul-1] == '\"'))
                     gMrpackUrl[--ul] = 0;
                 *mp = 0;                       /* aus dem Original entfernen */
-                char *orig = strstr(line, "--mrpack");
+                char *orig = strstr(line, gPackIsCf ? "--cfpack" : "--mrpack");
                 if (orig) {
                     char *rest = strstr(orig + 8, " --");
                     if (rest) memmove(orig, rest, strlen(rest) + 1);
