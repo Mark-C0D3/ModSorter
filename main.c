@@ -92,7 +92,7 @@ static int  gTextH = 16;               /* Zeilenhoehe der Schrift */
 
 /* Tabs links: 0 = Home, 1 = Browse, 2 = Servers */
 enum { TAB_HOME = 0, TAB_BROWSE = 1, TAB_SERVERS = 2 };
-static int   gTab = TAB_BROWSE;
+static int   gTab = TAB_HOME;
 static RECT  gTabRect[3];
 static int   gSideW = 200;             /* Breite der Sidebar */
 static int   gContentLeft = 0;         /* linke Kante des rechten Bereichs */
@@ -3606,6 +3606,11 @@ static LRESULT CALLBACK SearchProc(HWND h, UINT m, WPARAM w, LPARAM l)
 /* Liste neu befuellen - je nach Modus */
 static void pick_fill(HWND hwnd)
 {
+    /* Bei LBS_OWNERDRAWFIXED muessen wir die Zeilenhoehe abhaengig vom Modus
+     * setzen: 104 fuer die grossen Modrinth-artigen Karten, 34 fuer die
+     * kompakte Zeilenansicht (installierte Packs, Versionsliste). */
+    int ih = (gPickMode == 1) ? S(104) : S(34);
+    SendMessageA(gPickList, LB_SETITEMHEIGHT, 0, ih);
     SendMessageA(gPickList, LB_RESETCONTENT, 0, 0);
     int n = (gPickMode == 2) ? gVerN : gInstN;
     for (int i = 0; i < n; i++) {
@@ -3796,6 +3801,8 @@ static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (mi->CtlType == ODT_LISTBOX) {
             if (mi->CtlID == 3001)          /* Server-Liste */
                 mi->itemHeight = S(54);
+            else if (mi->CtlID == ID_PICK_LIST)
+                mi->itemHeight = (gPickMode == 1) ? S(104) : S(34);
             else
                 mi->itemHeight = (gPickMode == 1) ? S(104) : S(34);
         }
@@ -4698,12 +4705,28 @@ static void home_ensure_loaded(HWND wnd)
 static void apply_tab_visibility(void)
 {
     int b = (gTab == TAB_BROWSE);
-    HWND browseWnd[] = { gBtnPick, gEditPath, gBtnChoose, gBtnScan,
-                         gBtnCopy, gBtnServer, gLblStatus,
-                         gListC, gListS, gListB, gListU };
-    for (int i = 0; i < 11; i++)
-        if (browseWnd[i])
-            ShowWindow(browseWnd[i], b ? SW_SHOW : SW_HIDE);
+    /* Alte Browse-Elemente sind komplett aus dem Fenster raus - versteckt bleibt
+     * nur die Statuszeile, die auch der Serverbau braucht. */
+    HWND alwaysHidden[] = { gBtnPick, gEditPath, gBtnChoose, gBtnScan,
+                            gBtnCopy, gBtnServer,
+                            gListC, gListS, gListB, gListU };
+    for (int i = 0; i < 10; i++)
+        if (alwaysHidden[i])
+            ShowWindow(alwaysHidden[i], SW_HIDE);
+    if (gLblStatus) ShowWindow(gLblStatus, b ? SW_SHOW : SW_HIDE);
+
+    /* Neue Browse-Elemente (Modpack-Suche) */
+    HWND browseNew[] = { gPickSearch, gPickList,
+                         GetDlgItem(gMainWnd, ID_PICK_GO),
+                         GetDlgItem(gMainWnd, ID_PICK_SRC),
+                         GetDlgItem(gMainWnd, ID_PICK_SORT),
+                         GetDlgItem(gMainWnd, ID_PICK_MORE),
+                         GetDlgItem(gMainWnd, ID_PICK_LOAD),
+                         GetDlgItem(gMainWnd, ID_PICK_SERVER),
+                         GetDlgItem(gMainWnd, ID_PICK_BACK) };
+    for (int i = 0; i < 9; i++)
+        if (browseNew[i])
+            ShowWindow(browseNew[i], b ? SW_SHOW : SW_HIDE);
 
     int s = (gTab == TAB_SERVERS);
     if (gServerList)  ShowWindow(gServerList,  s ? SW_SHOW : SW_HIDE);
@@ -4744,50 +4767,44 @@ static void layout(HWND hwnd)
     apply_tab_visibility();
 
     if (gTab == TAB_BROWSE) {
-        /* --- obere Leiste: Modpack-Auswahl, Pfadfeld, dann Aktionen --- */
-        int bPick = S(170), bBrowse = S(142), bScan = S(104);
-        int ew = W - L - m - m - bPick - bBrowse - bScan - 3 * gap;
-        if (ew < S(120)) ew = S(120);
-        int x0 = L + m;
-        MoveWindow(gBtnPick, x0, m, bPick, btnH, TRUE);        x0 += bPick + gap;
-
-        gEditBox.left = x0;  gEditBox.top = m;
-        gEditBox.right = x0 + ew;  gEditBox.bottom = m + btnH;
+        /* --- Modrinth-Stil: grosses Suchfeld, Filterzeile, Karten --- */
+        int bGo = S(110);
+        int sw = W - L - 2 * m - gap - bGo;
+        gSearchBox.left = L + m; gSearchBox.top = m;
+        gSearchBox.right = L + m + sw; gSearchBox.bottom = m + btnH;
         int eh = gTextH + S(4);
-        MoveWindow(gEditPath, x0 + S(2), m + (btnH - eh) / 2, ew - S(4), eh, TRUE);
-        x0 += ew + gap;
-        MoveWindow(gBtnChoose, x0, m, bBrowse, btnH, TRUE);    x0 += bBrowse + gap;
-        MoveWindow(gBtnScan, x0, m, bScan, btnH, TRUE);
+        MoveWindow(gPickSearch, L + m + S(2), m + (btnH - eh) / 2,
+                   sw - S(4), eh, TRUE);
+        MoveWindow(GetDlgItem(hwnd, ID_PICK_GO), W - m - bGo, m, bGo, btnH, TRUE);
 
-        /* --- untere Leiste --- */
+        /* Filterzeile: Sort, Source links; More results rechts */
+        int fy = m + btnH + S(10);
+        int fh = S(32);
+        int bSrc = S(158), bSort = S(150), bMore = S(128);
+        MoveWindow(GetDlgItem(hwnd, ID_PICK_SRC),  L + m, fy, bSrc, fh, TRUE);
+        MoveWindow(GetDlgItem(hwnd, ID_PICK_SORT), L + m + bSrc + gap, fy,
+                   bSort, fh, TRUE);
+        MoveWindow(GetDlgItem(hwnd, ID_PICK_MORE), W - m - bMore, fy, bMore, fh, TRUE);
+
+        /* untere Leiste - Statuszeile links, Load + Create Server rechts */
         int by = H - m - btnH;
         gBarY = by - S(14);
-        int bSrv = S(206), bCopy = S(228);
-        MoveWindow(gBtnServer, W - m - bSrv, by, bSrv, btnH, TRUE);
-        MoveWindow(gBtnCopy, W - m - bSrv - gap - bCopy, by, bCopy, btnH, TRUE);
-        int stw = W - m - bSrv - gap - bCopy - gap - L - m;
+        int bSrv = S(206), bLoad = S(96);
+        MoveWindow(GetDlgItem(hwnd, ID_PICK_SERVER), W - m - bSrv, by, bSrv, btnH, TRUE);
+        MoveWindow(GetDlgItem(hwnd, ID_PICK_LOAD), W - m - bSrv - gap - bLoad,
+                   by, bLoad, btnH, TRUE);
+        MoveWindow(GetDlgItem(hwnd, ID_PICK_BACK), L + m, by, S(96), btnH, TRUE);
+        int stw = W - m - bSrv - gap - bLoad - gap - L - m - S(96) - gap;
         if (stw < S(40)) stw = S(40);
-        MoveWindow(gLblStatus, L + m, by + (btnH - S(18)) / 2, stw, S(18), TRUE);
+        MoveWindow(gLblStatus, L + m + S(96) + gap,
+                   by + (btnH - S(18)) / 2, stw, S(18), TRUE);
 
-        /* --- vier Karten --- */
-        gHdrH = S(42);
-        int cardTop = m + btnH + S(18);
-        int cardH = gBarY - S(14) - cardTop;
-        if (cardH < S(90)) cardH = S(90);
-
-        int colGap = S(12);
-        int colW = (W - L - 2 * m - 3 * colGap) / 4;
-        HWND lists[4] = { gListC, gListS, gListB, gListU };
-        int x = L + m;
-        for (int i = 0; i < 4; i++) {
-            gCard[i].left = x;
-            gCard[i].top = cardTop;
-            gCard[i].right = x + colW;
-            gCard[i].bottom = cardTop + cardH;
-            MoveWindow(lists[i], x + S(2), cardTop + gHdrH,
-                       colW - S(4), cardH - gHdrH - S(3), TRUE);
-            x += colW + colGap;
-        }
+        /* Ergebnis-Liste zwischen Filterzeile und unterer Leiste */
+        int listTop = fy + fh + S(10);
+        int listBot = gBarY - S(6);
+        int listH = listBot - listTop;
+        if (listH < S(80)) listH = S(80);
+        MoveWindow(gPickList, L + m, listTop, W - L - 2 * m, listH, TRUE);
     } else if (gTab == TAB_SERVERS) {
         int listW = S(280);
         MoveWindow(gServerList, L + m, m + S(46), listW, H - m - m - S(46), TRUE);
@@ -4952,7 +4969,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                                    (LONG_PTR)EditProc);
 
         gLblStatus = mk_static(hwnd, ID_LBL_STATUS,
-                               "Enter a mods folder and press Enter \x95 or use Browse",
+                               "Search for a modpack above, or pick one from the list",
                                gFont);
 
         gListC = mk_list(hwnd, ID_LIST_CLIENT);
@@ -5010,6 +5027,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(gServerInput, EM_SETCUEBANNER, TRUE,
                      (LPARAM)L"Server command (e.g. list, op <name>, stop) ...");
 
+        /* Browse-Tab: Modpack-Suche direkt eingebettet
+         * (das bisherige pick_modpack-Popup wird entwidmet) */
+        gPickWnd = hwnd;
+        gPickList = CreateWindowExA(0, "LISTBOX", "",
+                                    WS_CHILD | WS_VSCROLL |
+                                    LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS |
+                                    LBS_OWNERDRAWFIXED | LBS_NOTIFY,
+                                    0, 0, 10, 10, hwnd,
+                                    (HMENU)ID_PICK_LIST, NULL, NULL);
+        SendMessageA(gPickList, WM_SETFONT, (WPARAM)gFont, TRUE);
+        SetWindowTheme(gPickList, L"DarkMode_Explorer", NULL);
+
+        gPickSearch = CreateWindowExA(0, "EDIT", "",
+                                      WS_CHILD | ES_AUTOHSCROLL,
+                                      0, 0, 10, 10, hwnd,
+                                      (HMENU)ID_PICK_SEARCH, NULL, NULL);
+        SendMessageA(gPickSearch, WM_SETFONT, (WPARAM)gFont, TRUE);
+        SendMessageA(gPickSearch, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(S(10), S(10)));
+        SetWindowTheme(gPickSearch, L"DarkMode_CFD", NULL);
+        SendMessageA(gPickSearch, EM_SETCUEBANNER, TRUE,
+                     (LPARAM)L"Search modpacks ...");
+        gSearchOrig = (WNDPROC)SetWindowLongPtrA(gPickSearch, GWLP_WNDPROC,
+                                                 (LONG_PTR)SearchProc);
+
+        struct { int id; const char *t; } pbtns[6] = {
+            { ID_PICK_GO,     "Search" },
+            { ID_PICK_SRC,    src_label() },
+            { ID_PICK_SORT,   sort_label() },
+            { ID_PICK_MORE,   "More results" },
+            { ID_PICK_LOAD,   "Load" },
+            { ID_PICK_SERVER, "Create server pack ..." },
+        };
+        for (int i = 0; i < 6; i++) {
+            HWND b = CreateWindowA("BUTTON", pbtns[i].t,
+                                   WS_CHILD | BS_OWNERDRAW,
+                                   0, 0, 10, 10, hwnd,
+                                   (HMENU)(INT_PTR)pbtns[i].id, NULL, NULL);
+            SendMessageA(b, WM_SETFONT, (WPARAM)gFontB, TRUE);
+            SetWindowLongPtrA(b, GWLP_WNDPROC, (LONG_PTR)BtnProc);
+        }
+        /* Back-Button fuer die Versionsansicht */
+        HWND bBack = CreateWindowA("BUTTON", "Back",
+                                   WS_CHILD | BS_OWNERDRAW,
+                                   0, 0, 10, 10, hwnd,
+                                   (HMENU)(INT_PTR)ID_PICK_BACK, NULL, NULL);
+        SendMessageA(bBack, WM_SETFONT, (WPARAM)gFontB, TRUE);
+        SetWindowLongPtrA(bBack, GWLP_WNDPROC, (LONG_PTR)BtnProc);
+
         /* Server-Aktions-Buttons */
         HWND bStart  = mk_button(hwnd, 3010, "Start");
         HWND bStop   = mk_button(hwnd, 3011, "Stop");
@@ -5026,6 +5092,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         servers_load();
         servers_fill_list();
+
+        /* Home direkt laden (Karussell erscheint sofort statt beim ersten Klick) */
+        home_ensure_loaded(hwnd);
+        /* Browse-Liste vorbereiten (installierte Packs) */
+        enum_instances();
+        pick_fill(hwnd);
+        gPickMode = 0;
 
         layout(hwnd);
         apply_tab_visibility();
@@ -5119,12 +5192,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         if (gTab == TAB_BROWSE) {
-            round_box(dc, gEditBox, S(8), CINPUT,
-                      GetFocus() == gEditPath ? CACC : CBORDER);
-            static const char *titles[4] = { "Client-only", "Server-only",
-                                             "Server / Client", "Unknown" };
-            for (int i = 0; i < 4; i++)
-                draw_card(dc, i, titles[i]);
+            /* Rahmen ums Suchfeld */
+            round_box(dc, gSearchBox, S(8), CINPUT,
+                      GetFocus() == gPickSearch ? CACC : CBORDER);
+            /* Trennlinie ueber der unteren Leiste */
             hline(dc, gContentLeft + S(16), rc.right - S(16), gBarY, CBORDER);
         }
         else if (gTab == TAB_HOME) {
@@ -5331,6 +5402,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     InvalidateRect(hwnd, NULL, FALSE);
                     if (gTab == TAB_HOME)
                         home_ensure_loaded(hwnd);
+                    if (gTab == TAB_BROWSE && gInstN == 0) {
+                        /* beim ersten Oeffnen die installierten Packs zeigen */
+                        gPickMode = 0;
+                        enum_instances();
+                        pick_fill(hwnd);
+                    }
                 }
                 return 0;
             }
@@ -5404,6 +5481,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DRAWITEM: {
         LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
+
+        /* Pick-Liste und Pick-Buttons -> an die PickProc-Logik weiterreichen */
+        if (d->hwndItem == gPickList ||
+            (d->CtlType == ODT_BUTTON &&
+             (d->CtlID == ID_PICK_GO || d->CtlID == ID_PICK_SRC ||
+              d->CtlID == ID_PICK_SORT || d->CtlID == ID_PICK_MORE ||
+              d->CtlID == ID_PICK_LOAD || d->CtlID == ID_PICK_SERVER ||
+              d->CtlID == ID_PICK_BACK)))
+            return PickProc(hwnd, WM_DRAWITEM, wp, lp);
 
         /* ---- Server-Liste ---- */
         if (d->CtlType == ODT_LISTBOX && d->CtlID == 3001) {
@@ -5523,7 +5609,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* waehrend eines Downloads keine neuen Aktionen annehmen */
         if (gBusy && HIWORD(wp) == BN_CLICKED)
             return 0;
-        /* Fokusrahmen ums Pfadfeld neu zeichnen */
+        /* Fokusrahmen ums Suchfeld neu zeichnen */
+        if (LOWORD(wp) == ID_PICK_SEARCH &&
+            (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)) {
+            RECT er = gSearchBox;
+            InflateRect(&er, S(3), S(3));
+            InvalidateRect(hwnd, &er, FALSE);
+            return 0;
+        }
+        /* Pick-Nachrichten aus den Elementen im Browse-Tab an die bestehende
+         * PickProc-Logik weiterreichen */
+        {
+            int id = LOWORD(wp);
+            if (id == ID_PICK_GO || id == ID_PICK_SRC || id == ID_PICK_SORT ||
+                id == ID_PICK_MORE || id == ID_PICK_LOAD ||
+                id == ID_PICK_SERVER || id == ID_PICK_BACK ||
+                id == ID_PICK_LIST)
+                return PickProc(hwnd, WM_COMMAND, wp, lp);
+        }
+        /* Fokusrahmen ums Pfadfeld (falls es noch benutzt wird) */
         if (LOWORD(wp) == ID_EDIT_PATH &&
             (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)) {
             RECT er = gEditBox;
